@@ -6,7 +6,8 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from hypothesis import given, settings as h_settings
+from hypothesis import given
+from hypothesis import settings as h_settings
 from hypothesis import strategies as st
 
 from sequoia_x.core.config import Settings
@@ -32,12 +33,19 @@ def make_engine_in(tmp_dir: str) -> tuple[DataEngine, Settings]:
 @h_settings(max_examples=50, deadline=None)
 def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
     """相同 (symbol, date) 插入两次，数据库中该组合记录数应保持为 1。"""
-    with tempfile.TemporaryDirectory() as tmp_dir:
+    # ignore_cleanup_errors：Windows 上偶尔因文件占用/权限导致临时目录删不掉，
+    # 这属于环境问题，不应判定测试失败
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
         engine, _ = make_engine_in(tmp_dir)
         row = {
-            "symbol": symbol, "date": str(trade_date),
-            "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5,
-            "volume": 1000.0, "turnover": 10500.0,
+            "symbol": symbol,
+            "date": str(trade_date),
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.5,
+            "volume": 1000.0,
+            "turnover": 10500.0,
         }
         df = pd.DataFrame([row])
         with sqlite3.connect(engine.db_path) as conn:

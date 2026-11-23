@@ -1,5 +1,6 @@
 """配置管理模块：通过 pydantic-settings 从环境变量或 .env 文件加载系统配置。"""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +9,15 @@ class Settings(BaseSettings):
     start_date: str = "2024-01-01"
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}
+    #: 策略读取的行情窗口（交易日数）。下限 62：60 日均线策略需要 61 根 K 线。
+    snapshot_days: int = Field(default=130, ge=62)
+    #: 行情同步的并发进程数。8 个并发登录容易触发 baostock 限流，默认降到 4。
+    sync_workers: int = Field(default=4, ge=1, le=16)
+    #: 行情同步的时间预算（秒）。到点即收工，用已有数据继续选股，避免网络故障时挂死。
+    #: 实测 4 进程下每只股票约 0.15~0.2 s，全市场一轮约 3~4 分钟。
+    sync_max_seconds: float = Field(default=240.0, gt=0)
+    #: 是否按板块判定涨跌停（创业板/科创板 20%、北交所 30%）。关闭则沿用旧的 9.5%。
+    board_aware_limits: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -15,32 +25,6 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",  # <--- 加上这一行！让 Pydantic 放行未定义的变量
     )
-
-    @classmethod
-    def settings_customise_sources(cls, settings_cls, **kwargs):  # type: ignore[override]
-        """扩展配置源，支持从环境变量中扫描 STRATEGY_WEBHOOK_ 前缀的键。"""
-        from pydantic_settings import EnvSettingsSource
-        import os
-
-        sources = super().settings_customise_sources(settings_cls, **kwargs)
-
-        # 扫描环境变量，将 STRATEGY_WEBHOOK_<KEY> 收集到 strategy_webhooks
-        prefix = "STRATEGY_WEBHOOK_"
-        webhooks: dict[str, str] = {}
-        for key, value in os.environ.items():
-            if key.upper().startswith(prefix):
-                strategy_key = key[len(prefix):].lower()
-                webhooks[strategy_key] = value
-
-        # 注入到初始化数据中（通过 init_kwargs source）
-        if webhooks:
-            original_init = kwargs.get("init_settings")
-            # 直接在 env 层注入，通过 model_post_init 处理
-            os.environ.setdefault("_STRATEGY_WEBHOOKS_PARSED", "1")
-            # 存储解析结果供 model_validator 使用
-            cls._parsed_strategy_webhooks = webhooks
-
-        return sources
 
     def model_post_init(self, __context: object) -> None:
         """初始化后合并 STRATEGY_WEBHOOK_ 前缀的环境变量到 strategy_webhooks。"""
@@ -50,7 +34,7 @@ class Settings(BaseSettings):
         webhooks: dict[str, str] = dict(self.strategy_webhooks)
         for key, value in os.environ.items():
             if key.upper().startswith(prefix):
-                strategy_key = key[len(prefix):].lower()
+                strategy_key = key[len(prefix) :].lower()
                 webhooks[strategy_key] = value
 
         # 使用 object.__setattr__ 绕过 pydantic 的不可变保护

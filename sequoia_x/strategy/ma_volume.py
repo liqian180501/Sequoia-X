@@ -1,7 +1,5 @@
 """均线+成交量选股策略：5日均线上穿20日均线且成交量放大。"""
 
-import pandas as pd
-
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
 
@@ -11,9 +9,11 @@ logger = get_logger(__name__)
 class MaVolumeStrategy(BaseStrategy):
     """均线+成交量选股策略。
 
-    选股条件（全部向量化，严禁 iterrows）：
+    选股条件（全市场向量化，一次算完 5,224 只）：
     1. 5日收盘均线上穿20日收盘均线（金叉）
     2. 当日成交量 > 20日均量的 1.5 倍（放量确认）
+
+    实现上只对"每只股票的最后一行"判定，见 ``MarketSnapshot.latest``。
 
     Attributes:
         webhook_key: 路由到 'ma_volume' 专属飞书机器人。
@@ -21,43 +21,28 @@ class MaVolumeStrategy(BaseStrategy):
 
     webhook_key: str = "ma_volume"
 
+    _MIN_BARS: int = 21  # 20 日均线 + 昨日一行（金叉需要昨日均线）
+    _VOL_SURGE_RATIO: float = 1.5
+
     def run(self) -> list[str]:
-        """
-        遍历全市场，返回满足均线金叉+放量条件的股票代码列表。
+        """返回满足均线金叉+放量条件的股票代码列表。
 
         Returns:
-            满足条件的股票代码列表。
+            满足条件的股票代码列表，按代码升序。
         """
-        symbols = self.engine.get_local_symbols()
-        selected: list[str] = []
+        snap = self.engine.get_snapshot()
 
-        for symbol in symbols:
-            try:
-                df = self.engine.get_ohlcv(symbol)
-                if len(df) < 20:
-                    continue
+        ma5 = snap.rolling("close", 5)
+        ma20 = snap.rolling("close", 20)
+        # 昨日均线：等价于 ma5 / ma20 各自 shift(1)
+        ma5_prev = snap.rolling_shifted("close", 1, 5)
+        ma20_prev = snap.rolling_shifted("close", 1, 20)
+        vol_ma20 = snap.rolling("volume", 20)
 
-                # 向量化计算均线和成交量均值
-                df["ma5"] = df["close"].rolling(5).mean()
-                df["ma20"] = df["close"].rolling(20).mean()
-                df["vol_ma20"] = df["volume"].rolling(20).mean()
+        golden_cross = (ma5_prev < ma20_prev) & (ma5 > ma20)
+        volume_surge = snap.col("volume") > vol_ma20 * self._VOL_SURGE_RATIO
 
-                # 取最后两行判断金叉（昨日 ma5 < ma20，今日 ma5 > ma20）
-                last = df.iloc[-1]
-                prev = df.iloc[-2]
-
-                golden_cross = (
-                    prev["ma5"] < prev["ma20"]
-                    and last["ma5"] > last["ma20"]
-                )
-                volume_surge = last["volume"] > last["vol_ma20"] * 1.5
-
-                if golden_cross and volume_surge:
-                    selected.append(symbol)
-
-            except Exception as exc:
-                logger.warning(f"[{symbol}] 策略计算失败：{exc}")
-                continue
+        selected = snap.latest(golden_cross & volume_surge & snap.enough_bars(self._MIN_BARS))
 
         logger.info(f"MaVolumeStrategy 选出 {len(selected)} 只股票")
         return selected

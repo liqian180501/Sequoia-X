@@ -1,9 +1,8 @@
 """上升趋势跌停策略：趋势中放量跌停，捕捉错杀机会。"""
 
-import pandas as pd
-
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.limits import limit_down_multiplier
 
 logger = get_logger(__name__)
 
@@ -11,57 +10,48 @@ logger = get_logger(__name__)
 class UptrendLimitDownStrategy(BaseStrategy):
     """上升趋势跌停策略。
 
-    选股条件（向量化，严禁 iterrows）：
+    选股条件（全市场向量化，一次算完 5,224 只）：
     1. 处于上升趋势：昨日20日均线 > 昨日60日均线
-    2. 放量跌停：今日 close <= 昨日 close * 0.905
+    2. 放量跌停：今日 close <= 昨日 close × 跌停乘数（按板块，见 ``limits.py``）
                 且今日 volume > 20日均量的 2.0 倍
+
+    趋势判定用**昨日**均线，避免今日跌停把均线拉下来导致自我否定。
 
     Attributes:
         webhook_key: 路由到 'limit_down' 专属飞书机器人。
     """
 
     webhook_key: str = "limit_down"
-    _MIN_BARS: int = 60  # 至少需要 60 根 K 线（60日均线）
+
+    _MIN_BARS: int = 61  # 60 日均线 + 昨日一行
+    _LIMIT_DOWN_RATIO: float = 0.905
+    _VOL_SURGE_RATIO: float = 2.0
 
     def run(self) -> list[str]:
-        """
-        遍历全市场，返回满足上升趋势跌停条件的股票代码列表。
+        """返回满足上升趋势跌停条件的股票代码列表。
 
         Returns:
-            满足条件的股票代码列表。
+            满足条件的股票代码列表，按代码升序。
         """
-        symbols = self.engine.get_local_symbols()
-        selected: list[str] = []
+        snap = self.engine.get_snapshot()
 
-        for symbol in symbols:
-            try:
-                df = self.engine.get_ohlcv(symbol)
-                if len(df) < self._MIN_BARS:
-                    continue
+        ma20_prev = snap.rolling_shifted("close", 1, 20)
+        ma60_prev = snap.rolling_shifted("close", 1, 60)
+        vol_ma20 = snap.rolling("volume", 20)
+        prev_close = snap.shift("close", 1)
 
-                # 向量化计算均线
-                df["ma20"] = df["close"].rolling(20).mean()
-                df["ma60"] = df["close"].rolling(60).mean()
-                df["vol_ma20"] = df["volume"].rolling(20).mean()
+        uptrend = ma20_prev > ma60_prev
+        if self.settings.board_aware_limits:
+            limit_down = limit_down_multiplier(snap.col("symbol"))
+        else:
+            limit_down = self._LIMIT_DOWN_RATIO
+        volume_surge = snap.col("volume") > vol_ma20 * self._VOL_SURGE_RATIO
 
-                prev = df.iloc[-2]  # 昨日
-                today = df.iloc[-1]  # 今日
+        is_limit_down = snap.col("close") <= prev_close * limit_down
 
-                if pd.isna(prev["ma20"]) or pd.isna(prev["ma60"]) or pd.isna(today["vol_ma20"]):
-                    continue
-
-                # 条件 1：上升趋势（昨日均线多头排列）
-                uptrend = prev["ma20"] > prev["ma60"]
-                # 条件 2：放量跌停
-                limit_down = today["close"] <= prev["close"] * 0.905
-                volume_surge = today["volume"] > today["vol_ma20"] * 2.0
-
-                if uptrend and limit_down and volume_surge:
-                    selected.append(symbol)
-
-            except Exception as exc:
-                logger.warning(f"[{symbol}] UptrendLimitDownStrategy 计算失败：{exc}")
-                continue
+        selected = snap.latest(
+            uptrend & is_limit_down & volume_surge & snap.enough_bars(self._MIN_BARS)
+        )
 
         logger.info(f"UptrendLimitDownStrategy 选出 {len(selected)} 只股票")
         return selected

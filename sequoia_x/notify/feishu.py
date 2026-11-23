@@ -7,6 +7,7 @@ import requests
 
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
+from sequoia_x.data.cache import StockDirectory
 
 logger = get_logger(__name__)
 
@@ -24,9 +25,10 @@ class FeishuNotifier:
         初始化 FeishuNotifier。
 
         Args:
-            settings: Settings 实例，提供 Webhook URL 配置。
+            settings: Settings 实例，提供 Webhook URL 配置与数据库路径。
         """
         self.settings = settings
+        self._directory = StockDirectory(settings.db_path)
 
     @staticmethod
     def _to_xueqiu_code(code: str) -> str:
@@ -37,20 +39,23 @@ class FeishuNotifier:
             return f"BJ{code}"
         return f"SZ{code}"
 
-    @staticmethod
-    def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        import baostock as bs
-        bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
-        return mapping
+    def _get_stock_names(self, symbols: list[str]) -> dict[str, str]:
+        """查询股票名称，返回 ``{code: name}`` 映射。
+
+        优先读本地 ``stock_info`` 缓存表（毫秒级）；本地缺失时用一次 baostock
+        全市场列表查询补齐并落库。查询失败时返回空映射，调用方回落为显示代码。
+
+        Args:
+            symbols: 股票代码列表。
+
+        Returns:
+            ``{代码: 名称}``；失败时为空字典。
+        """
+        try:
+            return self._directory.get_names(symbols)
+        except Exception as exc:  # 名称只是展示优化，绝不能影响推送
+            logger.warning(f"查询股票名称失败，回落为代码显示：{exc}")
+            return {}
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
         today = date.today().strftime("%Y-%m-%d")
@@ -79,7 +84,11 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
+                            "content": (
+                                f"**日期：** {today}\n"
+                                f"**策略：** {strategy_name}\n"
+                                f"**选股数量：** {len(symbols)}"
+                            ),
                         },
                     },
                     {"tag": "hr"},
@@ -124,17 +133,25 @@ class FeishuNotifier:
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
-            # 解析飞书真正的返回体
-            resp_json = resp.json()
-
-            # 飞书真正的成功标志是内部的 code == 0
-            if resp.status_code != 200 or resp_json.get("code") != 0:
-                logger.error(
-                    f"飞书推送失败 [{webhook_key}] "
-                    f"HTTP状态={resp.status_code} 飞书响应={resp.text}"
-                )
-            else:
-                logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
-
         except requests.RequestException as exc:
             logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+            return
+
+        # 飞书真正的成功标志是响应体里的 code == 0，HTTP 200 不代表成功
+        try:
+            resp_json = resp.json()
+        except ValueError:
+            # 代理返回 HTML 错误页等非 JSON 响应：不能让它抛出去影响后面的策略
+            logger.error(
+                f"飞书返回非 JSON [{webhook_key}] "
+                f"HTTP状态={resp.status_code} 响应={resp.text[:200]}"
+            )
+            return
+
+        if resp.status_code != 200 or resp_json.get("code") != 0:
+            logger.error(
+                f"飞书推送失败 [{webhook_key}] "
+                f"HTTP状态={resp.status_code} 飞书响应={resp.text[:200]}"
+            )
+        else:
+            logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
