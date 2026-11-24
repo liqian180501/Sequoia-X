@@ -44,3 +44,4 @@ data/*.json
 # pytest 临时目录
 pytest-of-*/
 tmp*/
+data/dumps/
