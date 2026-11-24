@@ -78,12 +78,14 @@ class MarketSnapshot:
             self._cumcount = np.zeros(0, dtype=np.int64)
             self._bars = np.zeros(0, dtype=np.int64)
             self._symbols: list[str] = []
+            self.market_last_date: str | None = None
         else:
             grouped = df.groupby("symbol", sort=False)
             self._cumcount = grouped.cumcount().to_numpy()
             sizes = grouped.size()
             self._bars = df["symbol"].map(sizes).to_numpy(dtype=np.int64)
             self._symbols = sizes.index.tolist()
+            self.market_last_date = str(df["date"].max())
 
         #: 每只股票在快照中的最后一行（即"最新一根 K 线"）
         self._is_last = self._cumcount == self._bars - 1
@@ -139,6 +141,86 @@ class MarketSnapshot:
         if name not in self.df.columns:
             raise KeyError(f"行情快照没有列 {name!r}")
         return self.df[name]
+
+    def flag(self, name: str) -> pd.Series:
+        """返回一个布尔标记列；列不存在时返回全 False（便于可选过滤项）。
+
+        Args:
+            name: 列名，例如 ``is_st`` / ``is_stale``。
+
+        Returns:
+            与 ``df`` 等长的 bool Series。
+        """
+        if name in self.df.columns:
+            return self.df[name].fillna(False).astype(bool)
+        return pd.Series(False, index=self.df.index)
+
+    def rolling_series(
+        self,
+        series: pd.Series,
+        window: int,
+        how: RollingHow = "mean",
+        periods: int = 0,
+    ) -> pd.Series:
+        """对任意"与 df 对齐"的 Series 做分组安全滚动。
+
+        用于对**派生指标**再滚动，例如"近 5 日内是否出现金叉"。
+        实现与 ``rolling`` 相同：整列先滚动，再把每组头部 ``periods + window - 1``
+        行抹成 NaN（数据已按 symbol 连续排列）。
+
+        Args:
+            series: 与 ``df`` 等长、索引对齐的 Series。
+            window: 窗口长度。
+            how: 聚合方式。
+            periods: 先下移的行数（0 表示含当日）。
+
+        Returns:
+            与 ``df`` 等长的 Series。
+        """
+        self._check_window(window, how)
+        if len(series) != len(self.df):
+            raise ValueError(f"series 长度 {len(series)} 与快照行数 {len(self.df)} 不一致")
+
+        base = series
+        if periods > 0:
+            base = series.shift(periods)
+            base[self._cumcount < periods] = np.nan
+
+        out = getattr(base.rolling(window), how)()
+        out[self._cumcount < periods + window - 1] = np.nan
+        return out
+
+    def ranked(
+        self,
+        condition: pd.Series,
+        score: pd.Series,
+        limit: int | None = None,
+    ) -> list[str]:
+        """在每只股票的最后一行上过滤，并按 ``score`` 从高到低取前 ``limit`` 只。
+
+        Args:
+            condition: 与 ``df`` 等长的布尔 Series。
+            score: 与 ``df`` 等长的分数 Series（越大越优）。
+            limit: 最多返回的数量；None 或 0 表示不限制。
+
+        Returns:
+            股票代码列表（按分数降序；同分按代码升序，保证结果稳定）。
+        """
+        cond = np.asarray(pd.Series(condition).fillna(False), dtype=bool) & self._is_last
+        if not cond.any():
+            return []
+
+        scores = pd.Series(score).to_numpy(dtype="float64")[cond]
+        symbols = self.df["symbol"].to_numpy()[cond]
+
+        frame = pd.DataFrame({"symbol": symbols, "score": scores})
+        # NaN 分数排到最后
+        frame["score"] = frame["score"].fillna(float("-inf"))
+        frame = frame.sort_values(["score", "symbol"], ascending=[False, True])
+
+        if limit:
+            frame = frame.head(limit)
+        return frame["symbol"].tolist()
 
     # ── 分组安全的运算符 ──
 

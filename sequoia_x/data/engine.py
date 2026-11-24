@@ -320,12 +320,49 @@ class DataEngine:
         if not df.empty:
             df = df.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
             df = self._apply_universe(df)
+            df = self._annotate_snapshot(df)
 
         snapshot = MarketSnapshot(df, days)
         logger.info(
             f"行情快照加载完成：{snapshot.describe()}，耗时 {time.perf_counter() - t0:.1f}s"
         )
         return snapshot
+
+    def _annotate_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
+        """给快照补上两个通用过滤需要的列。
+
+        * ``is_stale``：该股票最后一根 K 线不是全市场最新交易日（停牌/退市）；
+        * ``is_st``：名称含 ST / *ST / 退（依赖本地 ``stock_info`` 目录）。
+
+        这两列属于"可交易性"而非策略逻辑，统一在这里算一次，策略层直接取用。
+        """
+        last_by_symbol = df.groupby("symbol", sort=False)["date"].transform("max")
+        df["is_stale"] = last_by_symbol < df["date"].max()
+
+        st_symbols = self._st_symbols()
+        df["is_st"] = df["symbol"].isin(st_symbols) if st_symbols else False
+        return df
+
+    def _st_symbols(self) -> set[str]:
+        """从本地股票目录里取出 ST / *ST / 退市 的代码集合。
+
+        目录为空时（还没跑过推送）返回空集合，并提示一次：此时 ST 过滤会失效。
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                total = conn.execute("SELECT COUNT(*) FROM stock_info").fetchone()[0]
+                if not total:
+                    logger.warning(
+                        "stock_info 目录为空，本次跳过 ST 过滤（任意一次正常推送会建立该目录）"
+                    )
+                    return set()
+                rows = conn.execute(
+                    "SELECT symbol FROM stock_info WHERE name LIKE '%ST%' OR name LIKE '%退%'"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning(f"读取股票目录失败，跳过 ST 过滤：{exc}")
+            return set()
+        return {row[0] for row in rows}
 
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:

@@ -21,11 +21,13 @@ from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
+from sequoia_x.strategy.reversal_bounce import ReversalBounceStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
+from sequoia_x.strategy.trend_pullback import TrendPullbackStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 
-#: 标识 → 策略类；字典顺序即默认执行顺序
+#: 标识 → 策略类；字典顺序即默认执行顺序（先趋势/突破，再回踩/反转，最后事件）
 STRATEGIES: dict[str, type[BaseStrategy]] = {
     MaVolumeStrategy.webhook_key: MaVolumeStrategy,
     TurtleTradeStrategy.webhook_key: TurtleTradeStrategy,
@@ -33,6 +35,8 @@ STRATEGIES: dict[str, type[BaseStrategy]] = {
     LimitUpShakeoutStrategy.webhook_key: LimitUpShakeoutStrategy,
     UptrendLimitDownStrategy.webhook_key: UptrendLimitDownStrategy,
     RpsBreakoutStrategy.webhook_key: RpsBreakoutStrategy,
+    TrendPullbackStrategy.webhook_key: TrendPullbackStrategy,
+    ReversalBounceStrategy.webhook_key: ReversalBounceStrategy,
     PrivatePlacementStrategy.webhook_key: PrivatePlacementStrategy,
 }
 

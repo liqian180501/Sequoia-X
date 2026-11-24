@@ -1,18 +1,14 @@
-"""行情富化数据的本地缓存：股票名称、流通市值。
+"""股票名称的本地缓存（``stock_info`` 表）。
 
 为什么需要
 ----------
-推送卡片要显示股票名称、海龟策略要按流通市值排序。这两件事原先都是"每只股票发一次
-baostock 查询"，实测成本：
+推送卡片要显示股票名称。原先是每只股票发一次 ``query_stock_basic``（实测约 180 ms/只），
+RPS 一天选出 200+ 只，光查名字就要 **37.7 s**；而名称几乎不变，完全没必要每次重查。
 
-* ``query_stock_basic``（查名称）：约 180 ms/只。RPS 一天选出 208 只，光查名字就 **37.7 s**；
-* ``query_history_k_data_plus``（查市值）：约 230 ms/只，54 个候选约 **12 s**。
+现在用**一次** ``query_all_stock`` 拉全市场名单（实测约 30 s）填满 5,000+ 只，
+之后名称查询全部走本地表（毫秒级）。列表按"锚定最近交易日"取，避免非交易日为空。
 
-而这些数据变化很慢，所以改为本地 SQLite 表缓存：
-
-* ``stock_info``：用**一次** ``query_all_stock`` 拉全市场名单（实测约 30 s）填满 5,000+ 只，
-  之后名称查询全部走本地表（毫秒级）。列表按"锚定最近交易日"取，避免非交易日为空；
-* ``market_cap``：按 ``(symbol, date)`` 缓存，同一天重复运行（调参、补推送）零网络成本。
+这张表还顺带支撑了 ST 过滤：``DataEngine._st_symbols()`` 从名称里识别 ST/*ST/退市。
 
 为什么不做"每次运行都刷新"
 --------------------------
@@ -23,7 +19,7 @@ baostock 查询"，实测成本：
 
 设计说明
 --------
-* 两张表都用 ``CREATE TABLE IF NOT EXISTS`` 建，老库自动迁移，无需手工 ALTER；
+* 表用 ``CREATE TABLE IF NOT EXISTS`` 建，老库自动迁移，无需手工 ALTER；
 * 构造函数可接受一个已存在的 ``sqlite3.Connection``（测试用 ``:memory:``），
   不传则每个操作自行开关连接（生产用，与 ``DataEngine`` 的风格一致）。
 """
@@ -50,15 +46,6 @@ CREATE TABLE IF NOT EXISTS stock_info (
     symbol     TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-);
-"""
-
-_CREATE_MARKET_CAP = """
-CREATE TABLE IF NOT EXISTS market_cap (
-    symbol TEXT NOT NULL,
-    date   TEXT NOT NULL,
-    value  REAL NOT NULL,
-    PRIMARY KEY (symbol, date)
 );
 """
 
@@ -249,53 +236,3 @@ class StockDirectory(_SqliteTable):
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) FROM stock_info").fetchone()
         return int(row[0]) if row else 0
-
-
-class MarketCapCache(_SqliteTable):
-    """按 ``(symbol, date)`` 缓存流通市值。"""
-
-    _DDL = _CREATE_MARKET_CAP
-
-    def get(self, symbols: list[str], day: str) -> dict[str, float]:
-        """读取指定日期的缓存市值。
-
-        Args:
-            symbols: 股票代码列表。
-            day: 日期字符串 ``YYYY-MM-DD``。
-
-        Returns:
-            ``{代码: 流通市值}``，未命中的代码不出现。
-        """
-        if not symbols:
-            return {}
-
-        result: dict[str, float] = {}
-        with self._connect() as conn:
-            for i in range(0, len(symbols), _CHUNK):
-                chunk = symbols[i : i + _CHUNK]
-                placeholders = ",".join("?" * len(chunk))
-                rows = conn.execute(
-                    f"SELECT symbol, value FROM market_cap "
-                    f"WHERE date = ? AND symbol IN ({placeholders})",
-                    (day, *chunk),
-                ).fetchall()
-                result.update({row[0]: row[1] for row in rows})
-        return result
-
-    def put(self, day: str, values: dict[str, float]) -> None:
-        """写入（或覆盖）某一天的多只股票市值。
-
-        Args:
-            day: 日期字符串 ``YYYY-MM-DD``。
-            values: ``{代码: 流通市值}``。
-        """
-        if not values:
-            return
-        rows = [(symbol, day, value) for symbol, value in values.items()]
-        with self._connect() as conn:
-            conn.executemany(
-                "INSERT INTO market_cap (symbol, date, value) VALUES (?, ?, ?) "
-                "ON CONFLICT(symbol, date) DO UPDATE SET value = excluded.value",
-                rows,
-            )
-            conn.commit()

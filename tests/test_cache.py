@@ -1,4 +1,4 @@
-"""本地缓存表（股票目录 / 流通市值）的单元测试。
+"""股票目录缓存（``stock_info``）的单元测试。
 
 用 ``sqlite3.connect(":memory:")`` 作为共享连接，因此不需要临时目录、也不打网络。
 """
@@ -8,9 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from sequoia_x.core.config import Settings
-from sequoia_x.data.cache import MarketCapCache, StockDirectory, to_stock_symbol
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
+from sequoia_x.data.cache import StockDirectory, to_stock_symbol
 
 
 @pytest.fixture
@@ -25,17 +23,9 @@ def directory(conn) -> StockDirectory:
     return StockDirectory(":memory:", conn=conn)
 
 
-@pytest.fixture
-def cap_cache(conn) -> MarketCapCache:
-    return MarketCapCache(":memory:", conn=conn)
-
-
 def insert_names(conn, pairs) -> None:
     conn.executemany("INSERT INTO stock_info (symbol, name) VALUES (?, ?)", pairs)
     conn.commit()
-
-
-# ── StockDirectory ──
 
 
 def test_returns_local_names_without_refresh(directory, conn, monkeypatch) -> None:
@@ -145,64 +135,3 @@ def test_many_missing_symbols_trigger_refresh(directory, conn, monkeypatch) -> N
 
     result = directory.get_names(["600000", "000001", "000002", "000003"])
     assert len(result) == 4
-
-
-# ── MarketCapCache ──
-
-
-def test_market_cap_roundtrip_and_date_isolation(cap_cache) -> None:
-    assert cap_cache.get(["600000"], "2026-11-19") == {}
-
-    cap_cache.put("2026-11-19", {"600000": 3.5e11})
-    assert cap_cache.get(["600000"], "2026-11-19") == {"600000": 3.5e11}
-    # 不同日期互不影响
-    assert cap_cache.get(["600000"], "2026-11-20") == {}
-
-
-def test_market_cap_upsert_overwrites(cap_cache) -> None:
-    cap_cache.put("2026-11-19", {"600000": 1.0})
-    cap_cache.put("2026-11-19", {"600000": 2.0})
-    assert cap_cache.get(["600000"], "2026-11-19") == {"600000": 2.0}
-
-
-def test_market_cap_empty_inputs(cap_cache) -> None:
-    assert cap_cache.get([], "2026-11-19") == {}
-    cap_cache.put("2026-11-19", {})  # 不应报错
-
-
-# ── 海龟策略接入缓存 ──
-
-
-def test_turtle_uses_market_cap_cache(conn, monkeypatch) -> None:
-    """第一次调用联网取市值并落库，第二次直接命中缓存。"""
-    cache = MarketCapCache(":memory:", conn=conn)
-    monkeypatch.setattr("sequoia_x.strategy.turtle_trade.MarketCapCache", lambda _p: cache)
-
-    strategy = TurtleTradeStrategy(
-        engine=MagicMock(),
-        settings=Settings(
-            db_path="data/unused.db",
-            start_date="2024-01-01",
-            feishu_webhook_url="https://example.com/hook",
-        ),
-    )
-
-    calls: list[list[str]] = []
-
-    def fake_fetch(symbols: list[str], today: str) -> dict[str, float]:
-        calls.append(symbols)
-        return {"600000": 3.5e11}
-
-    monkeypatch.setattr(strategy, "_fetch_market_caps", fake_fetch)
-
-    assert strategy._get_market_caps(["600000"]) == {"600000": 3.5e11}
-    assert len(calls) == 1
-
-    # 第二次同一天：直接读缓存，不再联网
-    assert strategy._get_market_caps(["600000"]) == {"600000": 3.5e11}
-    assert len(calls) == 1
-
-
-def test_turtle_market_caps_empty_input(monkeypatch) -> None:
-    strategy = TurtleTradeStrategy(engine=MagicMock(), settings=MagicMock())
-    assert strategy._get_market_caps([]) == {}

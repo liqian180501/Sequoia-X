@@ -1,22 +1,28 @@
-"""海龟交易策略：20日新高突破 + 成交额过亿 + 动量阳线过滤。"""
+"""海龟突破策略：55 日新高 + 趋势 + 量能确认，按相对强度排序。
+
+改造要点（对应原实现的不合理点）
+--------------------------------
+1. **突破窗口 20 日 → 55 日**：A 股 20 日高点噪声太大（一个月内反复创新高），
+   55 个交易日（约三个月）的新高才有"突破"含义。
+2. **要求"刚突破"而不是"任意突破"**：收盘价不超过前高的 5%，避免追已经远离
+   突破位 20% 的票。
+3. **趋势与量能双确认**：ma20>ma60 且量比 ≥1.3。原实现只有"成交额过亿"这一条
+   绝对阈值，对大盘股形同虚设、对小盘股又过严。
+4. **去掉流通市值排序**：按市值降序与"突破"没有任何因果关系，却要为此每天多打
+   50~200 次 baostock 请求（实测 ~9 秒）。改为按"相对强度 + 量比 + 突破幅度"
+   综合打分，既有依据又不联网。
+5. 通过通用过滤剔除 ST / 停牌 / 次新 / 低流动性 / 今日涨停（买不到）。
+"""
 
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data.cache import MarketCapCache
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.filters import pct_change, tradable_mask, volume_ratio
 
 logger = get_logger(__name__)
 
 
 class TurtleTradeStrategy(BaseStrategy):
-    """海龟交易策略（A股防诱多改良版）。
-
-    选股条件（全市场向量化，一次算完 5,224 只）：
-    1. 突破新高：今日 close > 前20个交易日 high 的最大值
-    2. 流动性：今日 turnover > 100,000,000
-    3. 防诱多过滤：今日必须是实体阳线（今日 close > 今日 open），
-       且必须真涨（今日 close > 昨日 close）
-
-    最后按流通市值从大到小排序（需要额外查一次 baostock）。
+    """55 日新高突破（趋势 + 量能确认，相对强度排序）。
 
     Attributes:
         webhook_key: 路由到 'turtle' 专属飞书机器人。
@@ -24,101 +30,38 @@ class TurtleTradeStrategy(BaseStrategy):
 
     webhook_key: str = "turtle"
 
-    _MIN_BARS: int = 21  # 20 日窗口 + 当日
-    _MIN_TURNOVER: float = 100_000_000
-
-    def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """查询候选股票的流通市值（不复权收盘价 × 流通股本），带本地缓存。
-
-        流通股本 = 成交量 / (换手率% / 100)
-        流通市值 = 流通股本 × 不复权收盘价
-
-        市值按 ``(symbol, date)`` 缓存在本地 ``market_cap`` 表：同一天重复运行
-        （调参、补推送）不再打网络；跨天则只对缓存未命中的候选查询 baostock。
-
-        Args:
-            symbols: 候选股票代码列表。
-
-        Returns:
-            ``{代码: 流通市值}``；查不到的股票不会出现（调用方按 0 处理）。
-        """
-        if not symbols:
-            return {}
-
-        from datetime import date
-
-        today_str = date.today().strftime("%Y-%m-%d")
-        cache = MarketCapCache(self.engine.db_path)
-
-        caps = cache.get(symbols, today_str)
-        missing = [s for s in symbols if s not in caps]
-        if not missing:
-            logger.info(f"流通市值命中缓存：{len(caps)} 只")
-            return caps
-
-        fetched = self._fetch_market_caps(missing, today_str)
-        if fetched:
-            cache.put(today_str, fetched)
-            caps.update(fetched)
-        return caps
-
-    def _fetch_market_caps(self, symbols: list[str], today_str: str) -> dict[str, float]:
-        """通过 baostock 逐只查询流通市值（无缓存，联网操作）。"""
-        import baostock as bs
-
-        market_caps: dict[str, float] = {}
-
-        bs.login()
-        try:
-            for symbol in symbols:
-                bs_code = self.engine._to_baostock_code(symbol)
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "close,volume,turn",
-                    start_date=today_str,
-                    end_date=today_str,
-                    frequency="d",
-                    adjustflag="3",  # 不复权，真实价格
-                )
-                while rs.next():
-                    row = rs.get_row_data()
-                    try:
-                        close = float(row[0])
-                        volume = float(row[1])
-                        turn = float(row[2])
-                        if turn > 0:
-                            circulating_shares = volume / (turn / 100)
-                            market_caps[symbol] = circulating_shares * close
-                    except (ValueError, ZeroDivisionError):
-                        continue
-        finally:
-            bs.logout()
-
-        return market_caps
+    _MIN_BARS: int = 61
+    _BREAKOUT_WINDOW: int = 55  # 突破窗口（交易日）
+    _MAX_BREAKOUT_MARGIN: float = 1.05  # 收盘价不超过前高的 5%（刚突破）
+    _VOL_SURGE: float = 1.3
 
     def run(self) -> list[str]:
-        """返回满足海龟突破条件的股票代码列表（按流通市值降序）。
-
-        Returns:
-            满足条件的股票代码列表。
-        """
+        """返回满足突破条件的股票代码列表（按综合强度降序）。"""
         snap = self.engine.get_snapshot()
+
         close = snap.col("close")
+        prior_high = snap.rolling_shifted("high", 1, self._BREAKOUT_WINDOW, "max")
 
-        breakout = close > snap.rolling_shifted("high", 1, 20, "max")
-        liquid = snap.col("turnover") > self._MIN_TURNOVER
-        # 拒绝高开低走的大阴线：实体必须是阳线，且相对昨收必须真涨
-        is_yang = close > snap.col("open")
-        is_up = close > snap.shift("close", 1)
+        breakout = close > prior_high
+        fresh = close <= prior_high * self._MAX_BREAKOUT_MARGIN
 
-        candidates = snap.latest(
-            breakout & liquid & is_yang & is_up & snap.enough_bars(self._MIN_BARS)
+        ma20 = snap.rolling("close", 20)
+        ma60 = snap.rolling("close", 60)
+        trend = (ma20 > ma60) & (close > ma60)
+
+        vol = volume_ratio(snap)
+        volume_ok = vol >= self._VOL_SURGE
+
+        # 综合打分：相对强度（市场分位）40% + 量比 30% + 突破幅度 30%
+        relative_strength = pct_change(snap, 120).rank(pct=True)
+        margin = (close / prior_high - 1.0).clip(lower=0.0)
+        score = relative_strength * 0.4 + vol.rank(pct=True) * 0.3 + margin.rank(pct=True) * 0.3
+
+        selected = snap.ranked(
+            tradable_mask(snap, self.settings) & breakout & fresh & trend & volume_ok,
+            score,
+            self.settings.max_picks or None,
         )
 
-        # 按流通市值从大到小排序
-        if candidates:
-            market_caps = self._get_market_caps(candidates)
-            candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
-
-        logger.info(f"TurtleTradeStrategy 选出 {len(candidates)} 只股票")
-        return candidates
+        logger.info(f"TurtleTradeStrategy 选出 {len(selected)} 只股票")
+        return selected

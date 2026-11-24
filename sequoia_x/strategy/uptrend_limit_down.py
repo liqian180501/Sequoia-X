@@ -1,21 +1,37 @@
-"""上升趋势跌停策略：趋势中放量跌停，捕捉错杀机会。"""
+"""上升趋势中的"错杀承接"策略（原"上升趋势跌停"）。
+
+改造要点（对应原实现的不合理点）
+--------------------------------
+原实现是"昨天上涨趋势 + 今天放量跌停 → 买入"，这在 A 股是典型的**接飞刀**：
+
+* 跌停当日往往**封死**，根本买不到；
+* 即使买到，跌停次日惯性下跌概率很高；
+* 只判断"跌幅 ≥ 9.5%/19.5%"和"放量"，完全不看**有没有资金承接**。
+
+改造后只保留"错杀"的合理内核，并用三个条件把"飞刀"过滤掉：
+
+1. **不买封死的跌停**：收盘价必须高于跌停价（盘中打开、有成交）；
+2. **必须有承接**：收出下影线（收盘价高于最低价 3% 以上），且收盘在当日振幅
+   的上半区（``close >= (high+low)/2``）；
+3. **放量但趋势未破**：量比 ≥1.5，且 ma20>ma60、收盘仍在 ma60 之上。
+
+即：把"跌停买入"改成"急跌 + 长下影 + 趋势未破"的**当日反包**信号。
+"""
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.filters import (
+    lower_shadow_ratio,
+    tradable_mask,
+    volume_ratio,
+)
 from sequoia_x.strategy.limits import limit_down_multiplier
 
 logger = get_logger(__name__)
 
 
 class UptrendLimitDownStrategy(BaseStrategy):
-    """上升趋势跌停策略。
-
-    选股条件（全市场向量化，一次算完 5,224 只）：
-    1. 处于上升趋势：昨日20日均线 > 昨日60日均线
-    2. 放量跌停：今日 close <= 昨日 close × 跌停乘数（按板块，见 ``limits.py``）
-                且今日 volume > 20日均量的 2.0 倍
-
-    趋势判定用**昨日**均线，避免今日跌停把均线拉下来导致自我否定。
+    """趋势中的急跌承接（未封死跌停 + 长下影 + 放量）。
 
     Attributes:
         webhook_key: 路由到 'limit_down' 专属飞书机器人。
@@ -23,34 +39,52 @@ class UptrendLimitDownStrategy(BaseStrategy):
 
     webhook_key: str = "limit_down"
 
-    _MIN_BARS: int = 61  # 60 日均线 + 昨日一行
-    _LIMIT_DOWN_RATIO: float = 0.905
-    _VOL_SURGE_RATIO: float = 2.0
+    _MIN_BARS: int = 61
+    _DROP: float = 0.94  # 今日跌幅 ≥6%
+    _VOL_SURGE: float = 1.5
+    _REBOUND: float = 1.03  # 收盘高于最低价 3%
 
     def run(self) -> list[str]:
-        """返回满足上升趋势跌停条件的股票代码列表。
-
-        Returns:
-            满足条件的股票代码列表，按代码升序。
-        """
+        """返回满足错杀承接条件的股票代码列表（按承接强度降序）。"""
         snap = self.engine.get_snapshot()
 
-        ma20_prev = snap.rolling_shifted("close", 1, 20)
-        ma60_prev = snap.rolling_shifted("close", 1, 60)
-        vol_ma20 = snap.rolling("volume", 20)
+        close = snap.col("close")
+        low = snap.col("low")
+        high = snap.col("high")
         prev_close = snap.shift("close", 1)
 
-        uptrend = ma20_prev > ma60_prev
-        if self.settings.board_aware_limits:
-            limit_down = limit_down_multiplier(snap.col("symbol"))
-        else:
-            limit_down = self._LIMIT_DOWN_RATIO
-        volume_surge = snap.col("volume") > vol_ma20 * self._VOL_SURGE_RATIO
+        ma20 = snap.rolling("close", 20)
+        ma60 = snap.rolling("close", 60)
 
-        is_limit_down = snap.col("close") <= prev_close * limit_down
+        # ① 趋势未破
+        trend = (ma20 > ma60) & (close > ma60)
 
-        selected = snap.latest(
-            uptrend & is_limit_down & volume_surge & snap.enough_bars(self._MIN_BARS)
+        # ② 今日急跌，但没有封死跌停（封死的买不到，且次日惯性大）
+        sharp_drop = close <= prev_close * self._DROP
+        not_sealed = close > prev_close * limit_down_multiplier(snap.col("symbol"))
+
+        # ③ 有承接：下影线 + 收盘在振幅上半区
+        rebound = close > low * self._REBOUND
+        upper_half = close >= (high + low) / 2.0
+
+        # ④ 放量（恐慌盘出清）
+        heavy = volume_ratio(snap) >= self._VOL_SURGE
+
+        # 打分：下影线占比 + 量比
+        score = (
+            lower_shadow_ratio(snap).rank(pct=True) * 0.5 + volume_ratio(snap).rank(pct=True) * 0.5
+        )
+
+        selected = snap.ranked(
+            tradable_mask(snap, self.settings)
+            & trend
+            & sharp_drop
+            & not_sealed
+            & rebound
+            & upper_half
+            & heavy,
+            score,
+            self.settings.max_picks or None,
         )
 
         logger.info(f"UptrendLimitDownStrategy 选出 {len(selected)} 只股票")

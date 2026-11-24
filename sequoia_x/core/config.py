@@ -19,6 +19,18 @@ class Settings(BaseSettings):
     #: 是否按板块判定涨跌停（创业板/科创板 20%、北交所 30%）。关闭则沿用旧的 9.5%。
     board_aware_limits: bool = True
 
+    # ── 选股通用过滤（见 strategy/filters.py）──
+    #: 最小成交额（元）。低于此值的票流动性差、滑点大
+    min_turnover: float = Field(default=50_000_000.0, ge=0)
+    #: 最小股价（元）。剔除仙股
+    min_price: float = Field(default=2.0, ge=0)
+    #: 快照窗口内最少的 K 线根数。低于此值视为次新/长期停牌
+    min_history_bars: int = Field(default=120, ge=3)
+    #: 每个策略最多输出的股票数（按分数取前 N）。0 表示不限制
+    max_picks: int = Field(default=30, ge=0)
+    #: 是否剔除 ST / *ST / 退市股
+    exclude_st: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
