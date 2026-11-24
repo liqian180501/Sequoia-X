@@ -806,3 +806,31 @@ CREATE INDEX idx_symbol_date ON stock_daily (symbol, date);   -- 完全重复
 ---
 
 下一步：动手改 → [10 常见任务 HOWTO](10-how-to-recipes.md)
+
+## P0-2 生存偏差：代码就绪，数据源全部不可用（2026-11 记录）
+
+**已完成（代码侧，已提交并测试）**：
+
+* `scripts/import_delisted.py`：akshare 退市清单（沪 161 + 深 213 = 374 只，其中 272 只在
+  10 年窗口内）→ 逐只取**后复权**日线 → 写入 `stock_daily` + `delisted` 表（带 3 次退避重试）；
+* `scripts/backtest.py` 的 `attach_st_flag` 已把 `delisted` 表里的股票**排除在 ST 名称过滤之外**
+  ——否则补进来的退市股（名字多含"退"）会被自己的过滤器剔掉，白补；
+* 若库里有 `delisted` 表，回测会自动纳入并打日志。
+
+**阻塞点：三条数据链同时不可用（逐个验证过）**
+
+| 数据源 | 现象 | 能否拿退市股历史 |
+|---|---|---|
+| baostock | `10001011 黑名单用户`（本机出口 IP 被拉黑） | 理论上可以，但连不上 |
+| 东财（akshare `stock_zh_a_hist`） | `ConnectionError / RemoteDisconnected` | 理论上可以，但连不上 |
+| 同花顺 REST `prices/historical` | 退市代码返回 `1002 Unknown thscode`；`600000.SH` 正常 | **不行**：标的库只含在市股票 |
+
+同花顺的 Market Dumps 也不含退市股（5,581 只里最后一根 K 线落后 30 天以上的只有 2 只）。
+
+**解除条件**：任一免费源恢复后，跑一条命令即可补完（约 7 分钟）：
+
+```bash
+python scripts/import_delisted.py --since 2016-01-01
+```
+
+补完后重跑回测，即可得到"去掉生存偏差"的收益——预期会比现在的数字更低。
