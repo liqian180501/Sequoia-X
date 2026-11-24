@@ -45,3 +45,4 @@ data/*.json
 pytest-of-*/
 tmp*/
 data/dumps/
+data/analytics.duckdb*
