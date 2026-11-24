@@ -298,6 +298,7 @@ class DataEngine:
         """从 SQLite 载入最近 ``days`` 个交易日的全市场行情。"""
         import time
 
+
         t0 = time.perf_counter()
 
         with sqlite3.connect(self.db_path) as conn:
@@ -396,10 +397,7 @@ class DataEngine:
         Returns:
             实际写入（或更新）的行数；无可更新数据时返回 0。
         """
-        import time
         from datetime import date, timedelta
-        from multiprocessing import Pool
-        from multiprocessing import TimeoutError as MPTimeoutError
 
         self.invalidate_snapshot()
         today_str = date.today().strftime("%Y-%m-%d")
@@ -428,9 +426,45 @@ class DataEngine:
             logger.info("所有股票已是最新，无需更新")
             return 0
 
-        n_workers = max(1, min(worker_count, len(tasks)))
+        return self._run_fetch(
+            tasks,
+            max_seconds=budget,
+            workers=worker_count,
+            label="同步",
+        )
+
+    def _run_fetch(
+        self,
+        tasks: list[tuple[str, str, str, str]],
+        *,
+        max_seconds: float | None,
+        workers: int | None,
+        label: str,
+    ) -> int:
+        """把任务分片交给多进程拉取，清洗后幂等写入 stock_daily。
+
+        Args:
+            tasks: ``(symbol, bs_code, start, end)`` 列表。
+            max_seconds: 时间预算；None 用配置值。
+            workers: 并发进程数；None 用配置值。
+            label: 日志里用的动作名（"同步" / "向前补齐"）。
+
+        Returns:
+            实际写入（或更新）的行数。
+        """
+
+        import time
+        from multiprocessing import Pool
+        from multiprocessing import TimeoutError as MPTimeoutError
+
+        if not tasks:
+            logger.info(f"{label}：没有需要处理的股票")
+            return 0
+
+        budget = self.sync_max_seconds if max_seconds is None else max_seconds
+        n_workers = max(1, min(workers or self.sync_workers, len(tasks)))
         logger.info(
-            f"需要更新 {len(tasks)} 只股票，{n_workers} 进程并行（时间预算 {budget:.0f}s）..."
+            f"{label}：{len(tasks)} 只股票，{n_workers} 进程并行（时间预算 {budget:.0f}s）..."
         )
 
         deadline = time.monotonic() + budget
@@ -442,12 +476,11 @@ class DataEngine:
         pool = Pool(n_workers)
         try:
             async_result = pool.map_async(_bs_fetch_batch, payload)
-            # 硬兜底：worker 内部已按 deadline 自行返回，这里再留 20s 余量防死锁
             results = async_result.get(timeout=budget + 20)
         except MPTimeoutError:
-            logger.error(f"同步超过 {budget + 20:.0f}s 仍未返回，强制终止子进程")
-        except Exception as exc:  # 子进程崩溃等
-            logger.error(f"同步子进程异常：{exc}")
+            logger.error(f"{label}超过 {budget + 20:.0f}s 仍未返回，强制终止子进程")
+        except Exception as exc:
+            logger.error(f"{label}子进程异常：{exc}")
         finally:
             pool.terminate()
             pool.join()
@@ -461,18 +494,16 @@ class DataEngine:
                 totals[key] += batch_stats.get(key, 0)
 
         logger.info(
-            f"同步结束（{elapsed:.1f}s）：成功 {totals['ok']} | 无数据 {totals['empty']} | "
-            f"失败 {totals['failed']} | 未处理 {totals['aborted']} | "
-            f"重连 {totals['reconnects']}"
+            f"{label}结束（{elapsed:.1f}s）：成功 {totals['ok']} | 无数据 {totals['empty']} | "
+            f"失败 {totals['failed']} | 未处理 {totals['aborted']} | 重连 {totals['reconnects']}"
         )
         if totals["failed"] or totals["aborted"]:
             logger.warning(
-                "本次同步未覆盖全部股票（网络/接口异常），"
-                "选股将基于已入库的数据；稍后可重跑 main.py 补齐"
+                f"{label}未覆盖全部股票（网络/接口异常），已写入的部分可用；稍后可重跑续传"
             )
 
         if not all_rows:
-            logger.info("无新数据（可能非交易日）")
+            logger.info(f"{label}：无新数据")
             return 0
 
         df = pd.DataFrame(
@@ -483,23 +514,89 @@ class DataEngine:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close"])
         df = df[df["volume"] > 0]
-
         if df.empty:
-            logger.info("解析后无有效数据")
+            logger.info(f"{label}：解析后无有效数据")
             return 0
 
         records = list(
-            df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]].itertuples(
-                index=False, name=None
-            )
+            df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
+            .itertuples(index=False, name=None)
         )
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany(_UPSERT_SQL, records)
             conn.commit()
 
         count = len(records)
-        logger.info(f"写入 {count} 条行情（{df['date'].nunique()} 个交易日，幂等 upsert）")
+        logger.info(
+            f"{label}：写入 {count} 行（{df['date'].nunique()} 个交易日，幂等 upsert）"
+        )
         return count
+
+    @staticmethod
+    def build_extend_tasks(
+        rows: list[tuple[str, str]], start_date: str
+    ) -> list[tuple[str, str, str, str]]:
+        """根据每只股票的最早日期，生成"向前补齐"的任务列表。
+
+        Args:
+            rows: ``(symbol, 库内最早日期)`` 列表。
+            start_date: 目标起点（YYYY-MM-DD）。
+
+        Returns:
+            ``(symbol, bs_code, start, end)`` 列表；已经早于 ``start_date`` 的股票会被跳过。
+        """
+        from datetime import date, timedelta
+
+        tasks = []
+        for symbol, first_date in rows:
+            if not first_date or first_date <= start_date:
+                continue
+            end = (date.fromisoformat(first_date) - timedelta(days=1)).strftime("%Y-%m-%d")
+            if end < start_date:
+                continue
+            tasks.append(
+                (symbol, DataEngine._to_baostock_code(symbol), start_date, end)
+            )
+        return tasks
+
+    def extend_history(
+        self,
+        start_date: str,
+        max_seconds: float | None = None,
+        workers: int | None = None,
+        symbols: list[str] | None = None,
+    ) -> int:
+        """把每只股票的历史起点**往前**补到 ``start_date``（或它的上市日）。
+
+        与 ``sync_today_bulk`` 互补：后者补"最新之后"，本方法补"最早之前"。
+        可反复运行续传——已经补到位的股票会被跳过。
+
+        Args:
+            start_date: 目标起点，如 ``"2015-01-01"``。
+            max_seconds: 单轮时间预算。
+            workers: 并发进程数。
+            symbols: 只补齐这些股票（None 表示全市场）。
+
+        Returns:
+            本次写入的行数。
+        """
+        self.invalidate_snapshot()
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol, MIN(date) FROM stock_daily GROUP BY symbol"
+            ).fetchall()
+        if symbols:
+            wanted = set(symbols)
+            rows = [r for r in rows if r[0] in wanted]
+
+        tasks = self.build_extend_tasks(rows, start_date)
+        if not tasks:
+            logger.info(f"所有股票的历史起点都已早于 {start_date}，无需补齐")
+            return 0
+        logger.info(f"需要向前补齐 {len(tasks)} 只股票（目标起点 {start_date}）")
+        return self._run_fetch(
+            tasks, max_seconds=max_seconds, workers=workers, label="向前补齐"
+        )
 
     def backfill(self, symbols: list[str], max_seconds: float | None = None) -> dict:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。

@@ -188,3 +188,27 @@ def test_set_universe_empty_restores_full_market(bare_engine) -> None:
     bare_engine.set_universe([])
 
     assert bare_engine.universe is None
+
+
+# ── 向前补齐的任务生成 ──
+
+
+def test_build_extend_tasks_basic() -> None:
+    """起点晚于目标日的股票才需要补齐，区间是 [目标日, 库内最早日-1]。"""
+    rows = [("600000", "2024-01-02"), ("000001", "2016-03-01")]
+    tasks = DataEngine.build_extend_tasks(rows, "2015-01-01")
+
+    assert tasks == [
+        ("600000", "sh.600000", "2015-01-01", "2024-01-01"),
+        ("000001", "sz.000001", "2015-01-01", "2016-02-29"),  # 闰年
+    ]
+
+
+def test_build_extend_tasks_skips_already_covered() -> None:
+    """已经早于目标日、或起点为空/无区间的股票应跳过。"""
+    rows = [("600000", "2014-12-31"), ("000001", None), ("000002", "2015-01-01")]
+    assert DataEngine.build_extend_tasks(rows, "2015-01-01") == []
+
+
+def test_build_extend_tasks_empty() -> None:
+    assert DataEngine.build_extend_tasks([], "2015-01-01") == []

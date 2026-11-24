@@ -68,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过数据同步，直接用库里的数据选股并推送（秒级）",
     )
+    mode.add_argument(
+        "--extend-history",
+        metavar="YYYY-MM-DD",
+        default=None,
+        help="历史起点向前补齐到该日期（只补数据，不选股；可反复运行续传）",
+    )
     mode.add_argument("--dry-run", action="store_true", help="只选股、不推送")
     mode.add_argument(
         "--force",
@@ -270,6 +276,25 @@ def main(argv: list[str] | None = None) -> None:
         if universe:
             engine.set_universe(universe)
         _log_plan(logger, settings, args, strategy_classes, universe)
+
+        # ── 向前补齐历史 ──
+        if args.extend_history:
+            rounds = max(1, args.sync_rounds)
+            for index in range(rounds):
+                written = engine.extend_history(
+                    args.extend_history,
+                    max_seconds=args.sync_timeout,
+                    workers=args.workers,
+                    symbols=engine.universe,
+                )
+                if written == 0:
+                    break
+                logger.info(
+                    f"第 {index + 1} 轮补齐写入 {written} 行"
+                    + ("，继续下一轮..." if index + 1 < rounds else "")
+                )
+            logger.info(f"向前补齐结束，总耗时 {time.perf_counter() - started:.1f}s")
+            return
 
         # ── 回填模式 ──
         if args.backfill:
