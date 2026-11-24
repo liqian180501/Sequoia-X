@@ -39,6 +39,7 @@ from sequoia_x.core.config import Settings, get_settings  # noqa: E402
 from sequoia_x.core.logger import get_logger  # noqa: E402
 from sequoia_x.data.snapshot import MarketSnapshot  # noqa: E402
 from sequoia_x.strategy.filters import tradable_mask  # noqa: E402
+from sequoia_x.strategy.limits import limit_up_multiplier  # noqa: E402
 from sequoia_x.strategy.registry import STRATEGIES  # noqa: E402
 
 logger = get_logger(__name__)
@@ -207,12 +208,65 @@ def picks_by_date(df: pd.DataFrame, cond: pd.Series, score: pd.Series, top: int)
 # ── 评估 ──
 
 
+def add_fillability(df: pd.DataFrame) -> pd.DataFrame:
+    """给行情表补上撮合需要的两列：``prev_close`` 与 ``next_open``。
+
+    为什么需要：回测假设"T+1 开盘买入"，但如果 T+1 一字涨停，**根本买不到**。
+    这需要用 T 日的收盘价与板块涨幅去判断，而不是看 T 日是否涨停。
+    """
+    grouped = df.groupby("symbol", sort=False)
+    df["prev_close"] = grouped["close"].shift(1)
+    df["next_open"] = grouped["open"].shift(-1)
+    return df
+
+
+def fillable(
+    merged: pd.DataFrame,
+    capital: float | None,
+    participation: float | None,
+) -> tuple[pd.DataFrame, dict]:
+    """按"成交量占比上限"与"次日一字板"筛掉买不到的委托。
+
+    Args:
+        merged: 已合并 ``turnover`` / ``next_open`` / ``prev_close`` 的选股明细。
+        capital: 组合总资金（元）；``None`` 表示不做容量约束。
+        participation: 单票最多占当日成交额的比例；``None`` 表示不约束。
+
+    Returns:
+        ``(剩下的明细, {"dropped_capacity": n, "dropped_limit_up": n})``。
+    """
+    stats = {"dropped_capacity": 0, "dropped_limit_up": 0}
+    if merged.empty:
+        return merged, stats
+
+    out = merged.copy()
+
+    # ① 次日开盘一字涨停 → 买不到（按板块涨幅，容差 0.5%）
+    prev = out["prev_close"]
+    mult = out["symbol"].map(lambda s: float(limit_up_multiplier(pd.Series([s])).iloc[0]))
+    out["limit_up_open"] = out["next_open"] >= prev * (mult - 0.005)
+    stats["dropped_limit_up"] = int(out["limit_up_open"].sum())
+    out = out[~out["limit_up_open"]]
+
+    # ② 资金量超过当日成交额的 participation → 买不到那么多（直接剔除，不做缩量近似）
+    if capital and participation and not out.empty:
+        per_name = capital / out.groupby("date")["symbol"].transform("size")
+        out["capacity"] = out["turnover"] * participation
+        over = per_name > out["capacity"]
+        stats["dropped_capacity"] = int(over.sum())
+        out = out[~over]
+
+    return out, stats
+
+
 def evaluate(
     picks: pd.DataFrame,
     df: pd.DataFrame,
     market: pd.DataFrame,
     horizons: list[int],
     cost: float = 0.0,
+    capital: float | None = None,
+    participation: float | None = None,
 ) -> dict:
     """把选股结果与真实收益对齐，算出各项指标。
 
@@ -220,13 +274,17 @@ def evaluate(
         cost: 单次往返交易成本（小数），从每笔收益里扣除（佣金+印花税+滑点）。
     """
     merged = picks.merge(
-        df[["symbol", "date"] + [f"fwd_{h}" for h in horizons]],
+        df[["symbol", "date", "turnover", "prev_close", "next_open"]].join(
+            df[[f"fwd_{h}" for h in horizons]]
+        ),
         on=["symbol", "date"],
         how="left",
     )
+    merged, fill_stats = fillable(merged, capital, participation)
     result: dict = {
         "days": int(picks["date"].nunique()),
         "trades": int(len(picks)),
+        "unfilled": fill_stats["dropped_capacity"] + fill_stats["dropped_limit_up"],
         "per_day": round(len(picks) / max(picks["date"].nunique(), 1), 1),
     }
     for h in horizons:
@@ -259,14 +317,17 @@ def evaluate(
 
 def print_table(rows: list[tuple[str, dict]], horizons: list[int]) -> None:
     """打印结果表。"""
-    head = f"{'策略':<18}{'天数':>5}{'笔数':>7}{'日均':>6}"
+    head = f"{'策略':<18}{'天数':>5}{'笔数':>7}{'未成交':>7}{'日均':>6}"
     for h in horizons:
         head += f"{'h' + str(h):>8}{'胜率':>7}{'超额':>8}"
     head += f"{'年化':>9}{'回撤':>8}{'夏普':>7}"
     print(head)
     print("-" * len(head))
     for name, m in rows:
-        line = f"{name:<18}{m.get('days', 0):>5}{m.get('trades', 0):>7}{m.get('per_day', 0):>6.1f}"
+        line = (
+            f"{name:<18}{m.get('days', 0):>5}{m.get('trades', 0):>7}"
+            f"{m.get('unfilled', 0):>7}{m.get('per_day', 0):>6.1f}"
+        )
         for h in horizons:
             line += (
                 f"{m.get(f'h{h}_mean', float('nan')):>8.2f}"
@@ -286,6 +347,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--strategy", default="all", help="逗号分隔的策略标识，all=全部")
     parser.add_argument("--horizons", default="1,3,5,10", help="持有天数，逗号分隔")
     parser.add_argument("--top", type=int, default=30, help="每日最多取前 N 只（0=不限）")
+    parser.add_argument(
+        "--capital", type=float, default=10_000_000, help="组合资金（元），用于容量约束"
+    )
+    parser.add_argument(
+        "--participation",
+        type=float,
+        default=0.01,
+        help="单票最多占当日成交额的比例（默认 1%%）",
+    )
+    parser.add_argument(
+        "--no-fill-check", action="store_true", help="关闭撮合约束（不检查容量与一字板）"
+    )
     parser.add_argument(
         "--cost",
         type=float,
@@ -313,6 +386,7 @@ def main(argv: list[str] | None = None) -> None:
     df = load_history(db_path)
     df = attach_st_flag(df, db_path)
     df = add_forward_returns(df, horizons)
+    df = add_fillability(df)
     snap = build_snapshot(df)
     market = market_forward_returns(df, horizons, universe=tradable_mask(snap, settings))
     print(
@@ -344,7 +418,15 @@ def main(argv: list[str] | None = None) -> None:
             picks = picks[picks["date"] >= lo]
             if hi:
                 picks = picks[picks["date"] < hi]
-            metrics = evaluate(picks, df, market, horizons, cost=args.cost)
+            metrics = evaluate(
+                picks,
+                df,
+                market,
+                horizons,
+                cost=args.cost,
+                capital=None if args.no_fill_check else args.capital,
+                participation=None if args.no_fill_check else args.participation,
+            )
             rows.append((key, metrics))
             records.append(
                 {

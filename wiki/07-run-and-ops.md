@@ -162,6 +162,10 @@ python main.py --extend-history 2015-01-01 --symbols 600000,000001 --dry-run  # 
 python scripts/backtest.py                                    # 全部策略，扣成本
 python scripts/backtest.py --horizons 1,5 --top 30 --train-end 2026-01-01
 python scripts/backtest.py --strategy turtle,rps --horizons 1,5,10
+
+# 撮合约束（默认开启）：1,000 万资金、单票最多占当日成交额 1%、次日一字板买不进
+python scripts/backtest.py --capital 5000000 --participation 0.005
+python scripts/backtest.py --no-fill-check                 # 关闭约束做对照
 ```
 口径：T 日收盘算信号、**T+1 开盘买入**、T+h 收盘卖出、往返成本 0.2%、基准为同日全市场等权。
 详见 [05 §7](05-strategy-system.md)。
