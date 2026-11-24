@@ -40,3 +40,7 @@ build/
 # 生成产物（backtest --out、无头截图等）
 data/*.json
 .shots/
+
+# pytest 临时目录
+pytest-of-*/
+tmp*/
