@@ -77,7 +77,7 @@ class TrendPullbackStrategy(BaseStrategy):
         shrink = vol <= self._SHRINK
 
         # 打分：中期涨幅 60% + 缩量程度 40%
-        score = gain60.rank(pct=True) * 0.6 + (1.0 - vol.clip(0, 2) / 2).rank(pct=True) * 0.4
+        score = snap.rank_pct(gain60) * 0.6 + snap.rank_pct(1.0 - vol.clip(0, 2) / 2) * 0.4
 
         return (
             tradable_mask(snap, self.settings) & trend & strong & touched & shrink,

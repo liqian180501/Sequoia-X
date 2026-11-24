@@ -71,10 +71,8 @@ class LimitUpShakeoutStrategy(BaseStrategy):
         above_ma10 = snap.col("close") > snap.rolling("close", 10)
 
         # 打分：昨日涨停强度 + 今日缩量程度（越缩越好）
-        limit_strength = (prev1_close / prev2_close - 1.0).rank(pct=True)
-        score = (
-            limit_strength * 0.6 + (1.0 - volume_ratio(snap).clip(0, 3) / 3).rank(pct=True) * 0.4
-        )
+        limit_strength = snap.rank_pct(prev1_close / prev2_close - 1.0)
+        score = limit_strength * 0.6 + snap.rank_pct(1.0 - volume_ratio(snap).clip(0, 3) / 3) * 0.4
 
         return (
             tradable_mask(snap, self.settings)

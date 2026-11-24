@@ -69,9 +69,9 @@ class TurtleTradeStrategy(BaseStrategy):
         volume_ok = vol >= self._VOL_SURGE
 
         # 综合打分：相对强度（市场分位）40% + 量比 30% + 突破幅度 30%
-        relative_strength = pct_change(snap, 120).rank(pct=True)
+        relative_strength = snap.rank_pct(pct_change(snap, 120))
         margin = (close / prior_high - 1.0).clip(lower=0.0)
-        score = relative_strength * 0.4 + vol.rank(pct=True) * 0.3 + margin.rank(pct=True) * 0.3
+        score = relative_strength * 0.4 + snap.rank_pct(vol) * 0.3 + snap.rank_pct(margin) * 0.3
 
         return (
             tradable_mask(snap, self.settings) & breakout & fresh & trend & volume_ok,

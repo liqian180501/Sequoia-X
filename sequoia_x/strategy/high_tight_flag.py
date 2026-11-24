@@ -98,9 +98,9 @@ class HighTightFlagStrategy(BaseStrategy):
 
         # 打分：旗杆强度 + 收敛程度 + 突破日量能
         score = (
-            pole_ratio.rank(pct=True) * 0.4
-            + (1.0 / (face_range + 0.01)).rank(pct=True) * 0.3
-            + volume_ratio(snap).rank(pct=True) * 0.3
+            snap.rank_pct(pole_ratio) * 0.4
+            + snap.rank_pct(1.0 / (face_range + 0.01)) * 0.3
+            + snap.rank_pct(volume_ratio(snap)) * 0.3
         )
 
         return (

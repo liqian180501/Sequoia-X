@@ -79,9 +79,7 @@ class SignalLedger:
             # 兼容旧库：早期版本没有 source 列
             columns = {row[1] for row in conn.execute("PRAGMA table_info(pick_history)")}
             if "source" not in columns:
-                conn.execute(
-                    "ALTER TABLE pick_history ADD COLUMN source TEXT DEFAULT 'live'"
-                )
+                conn.execute("ALTER TABLE pick_history ADD COLUMN source TEXT DEFAULT 'live'")
             conn.commit()
 
     # ── 写入 ──

@@ -88,7 +88,7 @@ class UptrendLimitDownStrategy(BaseStrategy):
 
         # 打分：下影线占比 + 量比
         score = (
-            lower_shadow_ratio(snap).rank(pct=True) * 0.5 + volume_ratio(snap).rank(pct=True) * 0.5
+            snap.rank_pct(lower_shadow_ratio(snap)) * 0.5 + snap.rank_pct(volume_ratio(snap)) * 0.5
         )
 
         return (

@@ -111,6 +111,23 @@ class MarketSnapshot:
         """每行所属股票在快照中的 K 线总数。"""
         return pd.Series(self._bars, index=self.df.index)
 
+    def rank_pct(self, series: pd.Series) -> pd.Series:
+        """按**交易日做横截面百分位**（0~1）。
+
+        为什么不能用全局 ``series.rank(pct=True)``：
+        线上只评估最后一行，全局排名近似于"当天的横截面分位"；但回测用全历史快照，
+        全局排名会把不同日期的股票混在一起算分母，分数与线上完全不同 → Top-N 会选出
+        不一样的股票。按日排名能让两条路径**构造上一致**，语义也更正确
+        （分位数本来就该在横截面内比较）。
+
+        Args:
+            series: 与快照等长的数值列。
+
+        Returns:
+            按日期分组的百分位（NaN 保持 NaN）。
+        """
+        return pd.Series(series, copy=False).groupby(self.df["date"]).rank(pct=True)
+
     def enough_bars(self, min_bars: int) -> pd.Series:
         """标记哪些行的股票在快照内至少有 ``min_bars`` 根 K 线。
 

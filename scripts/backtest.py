@@ -100,32 +100,41 @@ def market_forward_returns(df: pd.DataFrame, horizons: list[int]) -> pd.DataFram
 
 def rps_signals(
     snap: MarketSnapshot,
-    threshold: float = 80,
-    short_weight: float = 0.6,
+    threshold: float = 90,
+    short_weight: float = 0.4,
     near_high: float = 0.95,
 ) -> tuple[pd.Series, pd.Series]:
     """RPS 策略的 pandas 镜像（线上走 SQL 聚合，这里逐行重算，用于回测）。
 
-    与线上语义一致：63/250 日涨幅的横截面分位加权 → 距 250 日新高 5% 内 → 一年正收益。
+    与线上 ``_select()`` 的语义**逐步对齐**，否则回测会选出不同的股票：
+
+    1. 只保留 63/250 日窗口都有数据、且历史足够的股票（线上由 SQL 的 WHERE 负责）；
+    2. 在**这个子集内**做横截面百分位排名（分母 = 该日有效股票数）；
+    3. 过滤 ``rps >= threshold``、距 250 日新高 ``near_high`` 以内、一年正收益；
+    4. ``distance`` 的百分位在**筛选后的集合内**排名（线上是 ``picked[...].rank()``）。
     """
     close = snap.col("close")
     short = snap.shift("close", 63)
     long = snap.shift("close", 250)
     high_long = snap.rolling("high", 250, "max")
-
-    pct_short = close / short - 1.0
-    pct_long = close / long - 1.0
     by_date = snap.col("date")
 
+    # ① 先定子集，再排名（线上是 dropna 后再 rank）
+    valid = short.notna() & long.notna() & snap.enough_bars(125)
+
+    pct_short = (close / short - 1.0).where(valid)
+    pct_long = (close / long - 1.0).where(valid)
     rps_short = pct_short.groupby(by_date).rank(pct=True) * 100
     rps_long = pct_long.groupby(by_date).rank(pct=True) * 100
     rps = rps_short * short_weight + rps_long * (1 - short_weight)
 
-    valid = short.notna() & long.notna() & snap.enough_bars(125)
+    # ② 阈值 + 新高 + 正收益
     cond = valid & (rps >= threshold) & (close >= high_long * near_high) & (close > long)
 
-    distance = (close / high_long).clip(upper=1.0).groupby(by_date).rank(pct=True)
-    score = rps * 0.7 + distance * 100 * 0.3
+    # ③ distance 只在筛选后的集合内排名
+    distance = (close / high_long).clip(upper=1.0)
+    distance_rank = distance.where(cond).groupby(by_date).rank(pct=True)
+    score = rps * 0.7 + distance_rank * 100 * 0.3
     return cond, score
 
 
