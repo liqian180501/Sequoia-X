@@ -34,7 +34,9 @@ def price_frame(symbols: int = 60, days: int = 6) -> pd.DataFrame:
                     "turnover": 1e8 + i * 1e5,
                 }
             )
-    return pd.DataFrame(rows, columns=COLUMNS).sort_values(["symbol", "date"]).reset_index(drop=True)
+    return (
+        pd.DataFrame(rows, columns=COLUMNS).sort_values(["symbol", "date"]).reset_index(drop=True)
+    )
 
 
 # ── 收益口径 ──
