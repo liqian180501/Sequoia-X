@@ -36,8 +36,11 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sequoia_x.core.config import Settings, get_settings  # noqa: E402
+from sequoia_x.core.logger import get_logger  # noqa: E402
 from sequoia_x.data.snapshot import MarketSnapshot  # noqa: E402
 from sequoia_x.strategy.registry import STRATEGIES  # noqa: E402
+
+logger = get_logger(__name__)
 
 #: 无法回测的策略（需要 akshare 的历史公告，本地没有）
 SKIP = {"private_placement"}
@@ -58,7 +61,12 @@ def load_history(db_path: str) -> pd.DataFrame:
 
 
 def attach_st_flag(df: pd.DataFrame, db_path: str) -> pd.DataFrame:
-    """用本地股票目录标记 ST（注意：这是**当前**名称，存在轻微前视偏差）。"""
+    """用本地股票目录标记 ST（注意：这是**当前**名称，存在轻微前视偏差）。
+
+    但**退市股不能按名称剔除**：它们大多叫 ``xx退``，而补退市股的目的正是把它们纳入样本。
+    所以这里把 ``delisted`` 表里的股票排除在 ST 集合之外——否则 ``import_delisted.py``
+    辛苦补进来的历史会被过滤掉，生存偏差一点没修。
+    """
     try:
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
@@ -66,9 +74,18 @@ def attach_st_flag(df: pd.DataFrame, db_path: str) -> pd.DataFrame:
             ).fetchall()
     except sqlite3.Error:
         rows = []
-    st = {row[0] for row in rows}
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            delisted = {row[0] for row in conn.execute("SELECT symbol FROM delisted")}
+    except sqlite3.Error:
+        delisted = set()
+
+    st = {row[0] for row in rows} - delisted
     df["is_st"] = df["symbol"].isin(st) if st else False
     df["is_stale"] = False  # 回测里"某日没有 K 线"即视为停牌，由日期分组自然排除
+    if delisted:
+        logger.info(f"回测纳入 {len(delisted)} 只退市股（不按 ST 名称剔除）")
     return df
 
 
