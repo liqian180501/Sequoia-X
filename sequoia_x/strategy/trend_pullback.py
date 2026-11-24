@@ -25,7 +25,7 @@ class TrendPullbackStrategy(BaseStrategy):
 
     条件：
     1. 趋势：ma20 > ma60 且收盘 > ma60
-    2. 强势：60 日涨幅 ≥ 15%
+    2. 强势：60 日涨幅 ≥ 35%
     3. 回踩：最低价触及 ma20 上方 2% 以内，且收盘不低于 ma20 的 97%
     4. 不放量：量比 ≤ 0.9（回调没有明显放量，说明不是出货）
 
@@ -36,14 +36,30 @@ class TrendPullbackStrategy(BaseStrategy):
     webhook_key: str = "trend_pullback"
 
     _MIN_BARS: int = 61
-    _MIN_GAIN_60: float = 0.15
+    _MIN_GAIN_60: float = 0.35
     _TOUCH: float = 1.02
     _HOLD: float = 0.97
-    _SHRINK: float = 0.9
+    _SHRINK: float = 0.8
 
     def run(self) -> list[str]:
         """返回满足回踩条件的股票代码列表（按强势程度降序）。"""
         snap = self.engine.get_snapshot()
+        condition, score = self._signals(snap)
+        selected = snap.ranked(
+            condition,
+            score,
+            self.settings.max_picks or None,
+        )
+
+        logger.info(f"TrendPullbackStrategy 选出 {len(selected)} 只股票")
+        return selected
+
+    def _signals(self, snap):
+        """返回 (condition, score)：按行计算，不含"只看最后一行"的语义。
+
+        ``run()`` 在信号上取每只股票的最后一行并排序截断；回测时用同一份逻辑
+        在全部历史行上判定，保证与线上完全一致。
+        """
 
         close = snap.col("close")
         low = snap.col("low")
@@ -63,11 +79,7 @@ class TrendPullbackStrategy(BaseStrategy):
         # 打分：中期涨幅 60% + 缩量程度 40%
         score = gain60.rank(pct=True) * 0.6 + (1.0 - vol.clip(0, 2) / 2).rank(pct=True) * 0.4
 
-        selected = snap.ranked(
+        return (
             tradable_mask(snap, self.settings) & trend & strong & touched & shrink,
             score,
-            self.settings.max_picks or None,
         )
-
-        logger.info(f"TrendPullbackStrategy 选出 {len(selected)} 只股票")
-        return selected

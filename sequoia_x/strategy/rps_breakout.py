@@ -77,8 +77,8 @@ class RpsBreakoutStrategy(BaseStrategy):
 
     rps_period: int = 63
     long_period: int = 250
-    rps_threshold: int = 80
-    _SHORT_WEIGHT: float = 0.6
+    rps_threshold: int = 90
+    _SHORT_WEIGHT: float = 0.4
     _NEAR_HIGH: float = 0.95
 
     @property

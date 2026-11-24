@@ -35,6 +35,22 @@ class LimitUpShakeoutStrategy(BaseStrategy):
     def run(self) -> list[str]:
         """返回满足涨停洗盘条件的股票代码列表（按强度降序）。"""
         snap = self.engine.get_snapshot()
+        condition, score = self._signals(snap)
+        selected = snap.ranked(
+            condition,
+            score,
+            self.settings.max_picks or None,
+        )
+
+        logger.info(f"LimitUpShakeoutStrategy 选出 {len(selected)} 只股票")
+        return selected
+
+    def _signals(self, snap):
+        """返回 (condition, score)：按行计算，不含"只看最后一行"的语义。
+
+        ``run()`` 在信号上取每只股票的最后一行并排序截断；回测时用同一份逻辑
+        在全部历史行上判定，保证与线上完全一致。
+        """
 
         prev1_close = snap.shift("close", 1)
         prev2_close = snap.shift("close", 2)
@@ -60,7 +76,7 @@ class LimitUpShakeoutStrategy(BaseStrategy):
             limit_strength * 0.6 + (1.0 - volume_ratio(snap).clip(0, 3) / 3).rank(pct=True) * 0.4
         )
 
-        selected = snap.ranked(
+        return (
             tradable_mask(snap, self.settings)
             & limit_up_yesterday
             & not_one_word
@@ -69,8 +85,4 @@ class LimitUpShakeoutStrategy(BaseStrategy):
             & holds
             & above_ma10,
             score,
-            self.settings.max_picks or None,
         )
-
-        logger.info(f"LimitUpShakeoutStrategy 选出 {len(selected)} 只股票")
-        return selected

@@ -40,13 +40,29 @@ class UptrendLimitDownStrategy(BaseStrategy):
     webhook_key: str = "limit_down"
 
     _MIN_BARS: int = 61
-    _DROP: float = 0.94  # 今日跌幅 ≥6%
+    _DROP: float = 0.97  # 今日跌幅 ≥3%
     _VOL_SURGE: float = 1.5
     _REBOUND: float = 1.03  # 收盘高于最低价 3%
 
     def run(self) -> list[str]:
         """返回满足错杀承接条件的股票代码列表（按承接强度降序）。"""
         snap = self.engine.get_snapshot()
+        condition, score = self._signals(snap)
+        selected = snap.ranked(
+            condition,
+            score,
+            self.settings.max_picks or None,
+        )
+
+        logger.info(f"UptrendLimitDownStrategy 选出 {len(selected)} 只股票")
+        return selected
+
+    def _signals(self, snap):
+        """返回 (condition, score)：按行计算，不含"只看最后一行"的语义。
+
+        ``run()`` 在信号上取每只股票的最后一行并排序截断；回测时用同一份逻辑
+        在全部历史行上判定，保证与线上完全一致。
+        """
 
         close = snap.col("close")
         low = snap.col("low")
@@ -75,7 +91,7 @@ class UptrendLimitDownStrategy(BaseStrategy):
             lower_shadow_ratio(snap).rank(pct=True) * 0.5 + volume_ratio(snap).rank(pct=True) * 0.5
         )
 
-        selected = snap.ranked(
+        return (
             tradable_mask(snap, self.settings)
             & trend
             & sharp_drop
@@ -84,8 +100,4 @@ class UptrendLimitDownStrategy(BaseStrategy):
             & upper_half
             & heavy,
             score,
-            self.settings.max_picks or None,
         )
-
-        logger.info(f"UptrendLimitDownStrategy 选出 {len(selected)} 只股票")
-        return selected

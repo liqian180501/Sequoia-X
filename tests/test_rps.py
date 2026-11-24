@@ -75,10 +75,12 @@ def test_ranks_by_composite_strength() -> None:
 
 
 def test_max_picks_is_respected() -> None:
+    strategy = make_strategy(max_picks=2)
+    strategy.rps_threshold = 0  # 只测截断，不放阈值干扰
     frame = agg(
         [{"symbol": f"60000{i}", "close_now": 100.0 + i, "high_long": 101.0} for i in range(6)]
     )
-    assert len(make_strategy(max_picks=2)._select(frame)) == 2
+    assert len(strategy._select(frame)) == 2
 
 
 def test_threshold_can_be_loosened() -> None:

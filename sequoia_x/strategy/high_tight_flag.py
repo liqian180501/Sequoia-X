@@ -24,7 +24,7 @@ class HighTightFlagStrategy(BaseStrategy):
     """旗形整理后的放量突破。
 
     条件（全部基于收盘价）：
-    1. 旗杆：旗面之前的 50 个交易日（t-60 ~ t-11）内最高收盘 / 最低收盘 ≥ 1.4
+    1. 旗杆：旗面之前的 50 个交易日（t-60 ~ t-11）内最高收盘 / 最低收盘 ≥ 1.6
     2. 旗面：前 10 日收盘振幅 ≤ 18%，且最低收盘不低于旗杆高点的 80%
     3. 持续缩量：最近 5 日均量 ≤ 之前 20 日均量 × 0.85
     4. 突破：近 3 日内突破前 10 日最高收盘（×1.002），
@@ -37,7 +37,7 @@ class HighTightFlagStrategy(BaseStrategy):
     webhook_key: str = "flag"
 
     _MIN_BARS: int = 62
-    _POLE_RATIO: float = 1.4  # 旗杆涨幅
+    _POLE_RATIO: float = 1.6  # 旗杆涨幅
     _FLAG_RANGE: float = 0.18  # 旗面振幅
     _FLAG_HOLD: float = 0.80  # 旗面最低价相对旗杆高点的下限
     _SHRINK: float = 0.85  # 5 日均量 / 前 20 日均量
@@ -47,6 +47,22 @@ class HighTightFlagStrategy(BaseStrategy):
     def run(self) -> list[str]:
         """返回旗形突破的股票代码列表（按强度降序）。"""
         snap = self.engine.get_snapshot()
+        condition, score = self._signals(snap)
+        selected = snap.ranked(
+            condition,
+            score,
+            self.settings.max_picks or None,
+        )
+
+        logger.info(f"HighTightFlagStrategy 选出 {len(selected)} 只股票")
+        return selected
+
+    def _signals(self, snap):
+        """返回 (condition, score)：按行计算，不含"只看最后一行"的语义。
+
+        ``run()`` 在信号上取每只股票的最后一行并排序截断；回测时用同一份逻辑
+        在全部历史行上判定，保证与线上完全一致。
+        """
         close = snap.col("close")
 
         # ① 旗杆：旗面之前那 50 个交易日（t-60 ~ t-11）的收盘涨幅
@@ -87,7 +103,7 @@ class HighTightFlagStrategy(BaseStrategy):
             + volume_ratio(snap).rank(pct=True) * 0.3
         )
 
-        selected = snap.ranked(
+        return (
             tradable_mask(snap, self.settings)
             & (pole_ratio >= self._POLE_RATIO)
             & consolidation
@@ -97,8 +113,4 @@ class HighTightFlagStrategy(BaseStrategy):
             & still_above
             & breakout_vol,
             score,
-            self.settings.max_picks or None,
         )
-
-        logger.info(f"HighTightFlagStrategy 选出 {len(selected)} 只股票")
-        return selected

@@ -16,7 +16,6 @@ from sequoia_x.data.snapshot import MarketSnapshot
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.reversal_bounce import ReversalBounceStrategy
 from sequoia_x.strategy.trend_pullback import TrendPullbackStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
@@ -39,7 +38,6 @@ ALL_STRATEGIES = [
     LimitUpShakeoutStrategy,
     UptrendLimitDownStrategy,
     TrendPullbackStrategy,
-    ReversalBounceStrategy,
 ]
 
 

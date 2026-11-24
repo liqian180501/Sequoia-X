@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 
 
 class TurtleTradeStrategy(BaseStrategy):
-    """55 日新高突破（趋势 + 量能确认，相对强度排序）。
+    """90 日新高突破（趋势 + 量能确认，相对强度排序）。
 
     Attributes:
         webhook_key: 路由到 'turtle' 专属飞书机器人。
@@ -30,14 +30,30 @@ class TurtleTradeStrategy(BaseStrategy):
 
     webhook_key: str = "turtle"
 
-    _MIN_BARS: int = 61
-    _BREAKOUT_WINDOW: int = 55  # 突破窗口（交易日）
-    _MAX_BREAKOUT_MARGIN: float = 1.05  # 收盘价不超过前高的 5%（刚突破）
-    _VOL_SURGE: float = 1.3
+    _MIN_BARS: int = 91
+    _BREAKOUT_WINDOW: int = 90  # 突破窗口（交易日，≈4.5 个月；实测 90 > 55 > 40）
+    _MAX_BREAKOUT_MARGIN: float = 1.03  # 收盘价不超过前高的 3%（刚突破）
+    _VOL_SURGE: float = 1.2
 
     def run(self) -> list[str]:
         """返回满足突破条件的股票代码列表（按综合强度降序）。"""
         snap = self.engine.get_snapshot()
+        condition, score = self._signals(snap)
+        selected = snap.ranked(
+            condition,
+            score,
+            self.settings.max_picks or None,
+        )
+
+        logger.info(f"TurtleTradeStrategy 选出 {len(selected)} 只股票")
+        return selected
+
+    def _signals(self, snap):
+        """返回 (condition, score)：按行计算，不含"只看最后一行"的语义。
+
+        ``run()`` 在信号上取每只股票的最后一行并排序截断；回测时用同一份逻辑
+        在全部历史行上判定，保证与线上完全一致。
+        """
 
         close = snap.col("close")
         prior_high = snap.rolling_shifted("high", 1, self._BREAKOUT_WINDOW, "max")
@@ -57,11 +73,7 @@ class TurtleTradeStrategy(BaseStrategy):
         margin = (close / prior_high - 1.0).clip(lower=0.0)
         score = relative_strength * 0.4 + vol.rank(pct=True) * 0.3 + margin.rank(pct=True) * 0.3
 
-        selected = snap.ranked(
+        return (
             tradable_mask(snap, self.settings) & breakout & fresh & trend & volume_ok,
             score,
-            self.settings.max_picks or None,
         )
-
-        logger.info(f"TurtleTradeStrategy 选出 {len(selected)} 只股票")
-        return selected

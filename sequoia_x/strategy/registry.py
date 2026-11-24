@@ -21,7 +21,6 @@ from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
-from sequoia_x.strategy.reversal_bounce import ReversalBounceStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.trend_pullback import TrendPullbackStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
@@ -36,7 +35,6 @@ STRATEGIES: dict[str, type[BaseStrategy]] = {
     UptrendLimitDownStrategy.webhook_key: UptrendLimitDownStrategy,
     RpsBreakoutStrategy.webhook_key: RpsBreakoutStrategy,
     TrendPullbackStrategy.webhook_key: TrendPullbackStrategy,
-    ReversalBounceStrategy.webhook_key: ReversalBounceStrategy,
     PrivatePlacementStrategy.webhook_key: PrivatePlacementStrategy,
 }
 
