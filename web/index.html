@@ -107,6 +107,14 @@
       <button class="btn" id="btn-run">运行选股</button>
       <button class="btn danger" id="btn-push" disabled>推送到飞书</button>
     </div>
+    <details id="tune-box" style="margin-top:12px">
+      <summary style="cursor:pointer;color:var(--muted)">策略参数（可调关键阈值，改动只影响本次运行）</summary>
+      <div id="tune-panel" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-top:10px"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn ghost" id="btn-reset-params">恢复默认</button>
+        <span class="muted">参数越多越容易过拟合——能调 ≠ 该调</span>
+      </div>
+    </details>
     <div id="log"></div>
     <div id="select-result"></div>
   </section>
@@ -141,9 +149,13 @@
   <!-- 回测 -->
   <section id="tab-backtest" class="hidden">
     <div class="row">
-      <button class="btn" id="btn-backtest">加载回测结果</button>
-      <span class="muted">数据来自 <code>data/backtest_summary.json</code>（由 <code>scripts/backtest.py --out</code> 生成）</span>
+      <input type="text" id="bt-start" placeholder="起始日 2024-01-02" style="width:170px" />
+      <input type="text" id="bt-train" placeholder="样本内截止 2026-01-01" style="width:190px" />
+      <button class="btn" id="btn-run-backtest">运行回测</button>
+      <button class="btn ghost" id="btn-backtest">加载结果</button>
+      <span class="muted" id="bt-status"></span>
     </div>
+    <pre id="bt-log" class="hidden" style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11px;max-height:180px;overflow:auto"></pre>
     <div id="backtest-body" style="margin-top:14px"></div>
   </section>
 </main>
@@ -203,6 +215,34 @@ async function loadStatus() {
   return s;
 }
 
+/* ── 策略参数 ── */
+let TUNING = [];
+async function loadParams() {
+  const d = await api("/api/params");
+  TUNING = d.strategies;
+  $("#tune-panel").innerHTML = TUNING.map((s) => `
+    <div class="card">
+      <div class="k">${s.name}</div>
+      ${s.params.map((p) => `
+        <div class="row" style="margin-top:6px;gap:6px">
+          <span class="muted" style="flex:1;font-size:12px">${p.label}</span>
+          <input type="number" step="any" min="${p.min}" max="${p.max}"
+                 data-strategy="${s.key}" data-attr="${p.attr}" data-default="${p.default}"
+                 value="${p.default}" style="width:96px;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:4px 6px;font-size:12px" />
+        </div>`).join("")}
+    </div>`).join("");
+}
+function collectOverrides() {
+  const out = {};
+  document.querySelectorAll("#tune-panel input").forEach((el) => {
+    const v = Number(el.value);
+    const def = Number(el.dataset.default);
+    if (!Number.isFinite(v) || v === def) return;
+    (out[el.dataset.strategy] ||= {})[el.dataset.attr] = v;
+  });
+  return out;
+}
+
 /* ── 选股 ── */
 function selectedKeys() {
   return [...document.querySelectorAll("#strategy-checks input:checked")].map((i) => i.value);
@@ -218,7 +258,7 @@ async function runSelect() {
     const data = await api("/api/select", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ strategies: keys, limit }),
+      body: JSON.stringify({ strategies: keys, limit, overrides: collectOverrides() }),
     });
     renderSelect(data);
     $("#btn-push").disabled = false;
@@ -413,7 +453,46 @@ function renderLedger(d) {
   });
 }
 
-/* ── 回测 ── */
+/* ── 回测任务 ── */
+let btTimer = null;
+async function startBacktest() {
+  const body = {
+    start: $("#bt-start").value.trim() || null,
+    train_end: $("#bt-train").value.trim() || null,
+  };
+  $("#bt-status").textContent = "启动中…";
+  try {
+    const job = await api("/api/backtest/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    $("#bt-log").classList.remove("hidden");
+    $("#bt-status").textContent = `运行中（${job.id}）…`;
+    pollJob(job.id);
+  } catch (e) {
+    $("#bt-status").textContent = "启动失败：" + e.message;
+  }
+}
+
+async function pollJob(id) {
+  clearTimeout(btTimer);
+  try {
+    const job = await api(`/api/jobs?id=${id}`);
+    $("#bt-log").textContent = (job.tail || []).join("\n");
+    $("#bt-log").scrollTop = $("#bt-log").scrollHeight;
+    if (job.status === "running") {
+      btTimer = setTimeout(() => pollJob(id), 2000);
+      return;
+    }
+    $("#bt-status").textContent = job.status === "done" ? "完成" : `失败（退出码 ${job.exit_code}）`;
+    if (job.status === "done") loadBacktest();
+  } catch (e) {
+    $("#bt-status").textContent = "轮询失败：" + e.message;
+  }
+}
+
+/* ── 回测结果 ── */
 async function loadBacktest() {
   const data = await api("/api/backtest");
   if (!data.available) {
@@ -445,6 +524,8 @@ $("#btn-none").onclick = () => document.querySelectorAll("#strategy-checks input
 $("#btn-kline").onclick = loadKline;
 $("#symbol").addEventListener("keydown", (e) => { if (e.key === "Enter") loadKline(); });
 $("#btn-backtest").onclick = loadBacktest;
+$("#btn-run-backtest").onclick = startBacktest;
+$("#btn-reset-params").onclick = loadParams;
 $("#btn-ledger").onclick = loadLedger;
 $("#ledger-days").onchange = loadLedger;
 
@@ -452,6 +533,7 @@ const initialTab = (location.hash || "#overview").slice(1);
 if (initialTab !== "overview") showTab(initialTab);
 
 loadStatus().then(() => {
+  loadParams();
   if (initialTab === "kline" && !$("#symbol").value) { $("#symbol").value = "600000"; loadKline(); }
   if (initialTab === "backtest") loadBacktest();
   if (initialTab === "ledger") loadLedger();

@@ -59,6 +59,13 @@ python web/server.py --port 8123 --host 127.0.0.1
 - **名称/价格/涨跌幅/成交额**由前端请求后端补全（`enrich_picks()`），
   数据来自同一份 `MarketSnapshot`，不额外查库。
 
+页面下方有「**策略参数**」折叠区（P2-9）：每个策略暴露 2~3 个关键阈值（如 turtle 的突破窗口、
+rps 的 RPS 阈值），改完直接跑一次就能看选股差异，**不需要改代码**。
+
+* 参数值只作用在**本次请求构造的实例**上（`setattr(instance, ...)`），不污染类属性；
+* 后端只接受 `TUNING` 白名单里的属性，前端传别的会被忽略；
+* 只暴露少量参数——**参数越多越容易过拟合，能调不等于该调**。
+
 「推送到飞书」是**会真的发消息**的，所以：
 
 1. 必须点按钮（不是页面加载时自动发）；
@@ -107,8 +114,20 @@ python scripts/backtest.py --horizons 1,5 --top 30 \
     --out data/backtest_summary.json
 ```
 
-页面本身**不触发回测**：一次回测要读几百万行、跑几十秒到几分钟，放进 HTTP 请求里
-只会让人以为页面卡死。回测是命令行任务，页面只负责展示产物。
+页面可以**触发回测**（P2-9），但走的是**后台任务**而不是同步请求：
+
+1. 点「运行回测」→ 后端起一个子进程（`scripts/backtest.py`），立即返回 `job_id`；
+2. 前端每 2 秒轮询 `/api/jobs?id=...`，把子进程日志的 tail 显示出来（下方黑色框）；
+3. 任务结束（`done`）后自动加载结果。
+
+为什么不能同步：一次回测要读几百万行、跑几十秒到几分钟，同步等待只会让浏览器超时、
+用户以为页面卡死。
+
+两个实现细节：
+
+* 子进程必须设 `PYTHONUNBUFFERED=1`，否则 stdout 被缓冲，日志要等进程退出才有内容，
+  页面上看不到任何"进度"；
+* 日志写到 `logs/job<N>.log`，`/api/jobs` 只返回最后 20 行，避免把大日志塞进响应。
 
 ---
 
@@ -119,9 +138,12 @@ python scripts/backtest.py --horizons 1,5 --top 30 \
 | GET | `/` | 单页控制台 |
 | GET | `/api/status` | 数据库规模、配置、策略清单、上次运行 |
 | GET | `/api/strategies` | 策略标识与说明 |
-| POST | `/api/select` | 跑选股：`{"strategies":["ma_volume"],"limit":30}` |
+| POST | `/api/select` | 跑选股：`{"strategies":["ma_volume"],"limit":30,"overrides":{"turtle":{"_VOL_SURGE":2.0}}}` |
 | POST | `/api/push` | 推送上次结果，必须 `{"confirm": true}` |
 | GET | `/api/kline?symbol=600000&limit=120` | K 线（升序返回） |
+| GET | `/api/params` | 可调参数白名单（含默认值、上下限） |
+| POST | `/api/backtest/start` | 起一个后台回测任务，返回 `job_id` |
+| GET | `/api/jobs?id=job1` | 任务状态 + 日志 tail |
 | GET | `/api/ledger?days=60` | 纸面账本：各策略业绩 + 最近留痕 |
 | GET | `/api/backtest` | 回测结果 JSON |
 

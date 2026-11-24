@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 import time
 import traceback
@@ -70,6 +72,106 @@ _RUN_LOCK = threading.Lock()
 
 #: 上一次选股结果（进程内）：/api/push 只允许推它，避免"GET 一下就推送"
 _LAST_RUN: dict = {}
+
+#: 允许在网页上调的策略参数：``{策略: {属性: (标题, 默认值, 最小, 最大)}}``。
+#: 只暴露少量关键参数——参数越多越容易过拟合，能调不等于该调。
+TUNING: dict[str, dict[str, tuple[str, float, float, float]]] = {
+    "turtle": {
+        "_BREAKOUT_WINDOW": ("突破窗口(日)", 90, 20, 250),
+        "_VOL_SURGE": ("量比下限", 1.2, 1.0, 3.0),
+        "_MAX_BREAKOUT_MARGIN": ("突破幅度上限", 1.03, 1.0, 1.10),
+    },
+    "rps": {
+        "rps_threshold": ("RPS 阈值", 90, 50, 99),
+        "_SHORT_WEIGHT": ("短周期权重", 0.4, 0.0, 1.0),
+        "_NEAR_HIGH": ("距新高比例", 0.95, 0.80, 1.0),
+    },
+    "ma_volume": {
+        "_VOL_SURGE": ("量比下限", 1.5, 1.0, 3.0),
+        "_CROSS_LOOKBACK": ("金叉回看(日)", 3, 1, 20),
+        "_MAX_EXTENSION": ("不追高上限", 1.20, 1.0, 1.50),
+    },
+    "flag": {
+        "_POLE_RATIO": ("旗杆涨幅", 1.6, 1.2, 3.0),
+        "_FLAG_RANGE": ("旗面振幅上限", 0.18, 0.05, 0.40),
+    },
+    "shakeout": {
+        "_SHRINK": ("缩量上限", 0.8, 0.3, 1.0),
+        "_MAX_CLOSE_DROP": ("收盘下限", 0.97, 0.90, 1.0),
+    },
+    "limit_down": {
+        "_DROP": ("跌幅阈值", 0.97, 0.90, 1.0),
+        "_VOL_SURGE": ("量比下限", 1.5, 1.0, 3.0),
+    },
+    "trend_pullback": {
+        "_MIN_GAIN_60": ("60日涨幅下限", 0.35, 0.05, 1.00),
+        "_SHRINK": ("缩量上限", 0.8, 0.3, 1.0),
+    },
+}
+
+
+class JobManager:
+    """极简后台任务：跑子进程，状态靠轮询。
+
+    为什么不把回测塞进 HTTP 请求：一次回测要读几百万行、跑几分钟，
+    同步等待只会让浏览器超时、用户以为页面卡死。
+    """
+
+    def __init__(self, log_dir: Path) -> None:
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._jobs: dict[str, dict] = {}
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def start(self, name: str, argv: list[str]) -> dict:
+        """启动一个子进程任务，返回任务描述。"""
+        with self._lock:
+            self._counter += 1
+            job_id = f"job{self._counter}"
+        log_path = self.log_dir / f"{job_id}.log"
+        # PYTHONUNBUFFERED：不加的话子进程的 stdout 会被缓冲，日志文件要等退出才有内容，
+        # 页面上就看不到进度；PYTHONIOENCODING：避免中文日志写成乱码。
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        with log_path.open("w", encoding="utf-8") as fh:
+            proc = subprocess.Popen(
+                argv, stdout=fh, stderr=subprocess.STDOUT, cwd=str(ROOT), env=env
+            )
+        job = {
+            "id": job_id,
+            "name": name,
+            "status": "running",
+            "started": time.strftime("%H:%M:%S"),
+            "log": str(log_path.name),
+            "proc": proc,
+        }
+        self._jobs[job_id] = job
+        return self._public(job)
+
+    def get(self, job_id: str) -> dict | None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        proc = job["proc"]
+        if job["status"] == "running" and proc.poll() is not None:
+            job["status"] = "done" if proc.returncode == 0 else "failed"
+            job["exit_code"] = proc.returncode
+            job["finished"] = time.strftime("%H:%M:%S")
+        return self._public(job)
+
+    def tail(self, job_id: str, lines: int = 20) -> list[str]:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return []
+        path = self.log_dir / job["log"]
+        if not path.exists():
+            return []
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return [line.rstrip() for line in fh.readlines()[-lines:]]
+
+    @staticmethod
+    def _public(job: dict) -> dict:
+        return {k: v for k, v in job.items() if k != "proc"}
 
 
 # ── 纯函数（便于单测） ──
@@ -197,6 +299,33 @@ class App:
         self.directory = StockDirectory(self.settings.db_path)
         self.notifier = FeishuNotifier(self.settings)
         self.ledger = SignalLedger(self.settings.db_path)
+        self.jobs = JobManager(ROOT / "logs")
+
+    @staticmethod
+    def tuning_meta() -> list[dict]:
+        """把 TUNING 转成前端能渲染的结构。"""
+        out = []
+        for key, params in TUNING.items():
+            cls = STRATEGIES.get(key)
+            if cls is None:
+                continue
+            out.append(
+                {
+                    "key": key,
+                    "name": cls.__name__,
+                    "params": [
+                        {
+                            "attr": attr,
+                            "label": label,
+                            "default": cls.__dict__.get(attr, default),
+                            "min": lo,
+                            "max": hi,
+                        }
+                        for attr, (label, default, lo, hi) in params.items()
+                    ],
+                }
+            )
+        return out
 
     def status(self) -> dict:
         db = db_stats(self.settings.db_path)
@@ -214,7 +343,12 @@ class App:
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    def select(self, keys: list[str] | None, limit: int | None) -> dict:
+    def select(
+        self,
+        keys: list[str] | None,
+        limit: int | None,
+        overrides: dict[str, dict[str, float]] | None = None,
+    ) -> dict:
         """跑选股（不推送），结果缓存在 ``_LAST_RUN`` 供 /api/push 使用。"""
         classes: list[type[BaseStrategy]] = (
             resolve_strategies("all") if not keys else [STRATEGIES[k] for k in keys]
@@ -227,7 +361,12 @@ class App:
         for cls in classes:
             t0 = time.perf_counter()
             try:
-                picks = cls(engine=self.engine, settings=self.settings).run()
+                strategy = cls(engine=self.engine, settings=self.settings)
+                # 参数覆盖只作用在这一个实例上，不污染类属性
+                for attr, value in (overrides or {}).get(cls.webhook_key, {}).items():
+                    if attr in TUNING.get(cls.webhook_key, {}):
+                        setattr(strategy, attr, value)
+                picks = strategy.run()
                 error = None
             except Exception as exc:  # 单个策略失败不影响其它
                 logger.exception(f"{cls.__name__} 运行失败")
@@ -353,6 +492,18 @@ class Handler(BaseHTTPRequestHandler):
                 data["name"] = self.app.directory.get_names([symbol]).get(symbol, "")
                 self._json(data)
                 return
+            if parsed.path == "/api/params":
+                self._json({"strategies": App.tuning_meta()})
+                return
+            if parsed.path == "/api/jobs":
+                job_id = (query.get("id") or [""])[0]
+                job = self.app.jobs.get(job_id)
+                if job is None:
+                    self._error("任务不存在", 404)
+                    return
+                job["tail"] = self.app.jobs.tail(job_id)
+                self._json(job)
+                return
             if parsed.path == "/api/ledger":
                 days = min(max(int((query.get("days") or ["60"])[0]), 5), 365)
                 strategy = (query.get("strategy") or [None])[0]
@@ -384,8 +535,40 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 limit = body.get("limit")
                 limit = int(limit) if limit else None
+                overrides = body.get("overrides") or {}
+                if overrides:
+                    bad = [k for k in overrides if k not in STRATEGIES]
+                    if bad:
+                        self._error(f"未知策略：{bad}")
+                        return
                 with _RUN_LOCK:
-                    self._json(self.app.select(keys, limit))
+                    self._json(self.app.select(keys, limit, overrides))
+                return
+
+            if parsed.path == "/api/backtest/start":
+                try:
+                    top = int(body.get("top") or 30)
+                    capital = float(body.get("capital") or 10_000_000)
+                except (TypeError, ValueError):
+                    self._error("top/capital 必须是数字")
+                    return
+                argv = [
+                    sys.executable,
+                    "scripts/backtest.py",
+                    "--horizons",
+                    "1,5",
+                    "--top",
+                    str(top),
+                    "--capital",
+                    str(capital),
+                    "--out",
+                    "data/backtest_summary.json",
+                ]
+                if body.get("start"):
+                    argv.extend(["--start", str(body["start"])])
+                if body.get("train_end"):
+                    argv.extend(["--train-end", str(body["train_end"])])
+                self._json(self.app.jobs.start("回测", argv))
                 return
 
             if parsed.path == "/api/push":
