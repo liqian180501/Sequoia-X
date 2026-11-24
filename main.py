@@ -280,6 +280,7 @@ def main(argv: list[str] | None = None) -> None:
         # ── 向前补齐历史 ──
         if args.extend_history:
             rounds = max(1, args.sync_rounds)
+            stalled = 0
             for index in range(rounds):
                 written = engine.extend_history(
                     args.extend_history,
@@ -288,7 +289,22 @@ def main(argv: list[str] | None = None) -> None:
                     symbols=engine.universe,
                 )
                 if written < 0:
-                    break
+                    break  # 没有待补任务了
+                if written == 0:
+                    # 本轮没有任何进展：多半是 baostock 不可用。退避重试，连续失败就收工，
+                    # 避免对着宕掉的服务端每十几秒撞一次。
+                    stalled += 1
+                    if stalled >= 3:
+                        logger.error(
+                            "连续 3 轮没有任何进展（baostock 可能不可用），本次补齐中止；"
+                            "稍后重跑同一条命令即可续传"
+                        )
+                        break
+                    wait = 60 * stalled
+                    logger.warning(f"本轮没有写入，{wait}s 后重试...")
+                    time.sleep(wait)
+                    continue
+                stalled = 0
                 logger.info(
                     f"第 {index + 1} 轮补齐写入 {written} 行"
                     + ("，继续下一轮..." if index + 1 < rounds else "")
