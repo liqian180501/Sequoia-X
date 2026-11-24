@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sequoia_x.core.config import Settings, get_settings  # noqa: E402
 from sequoia_x.core.logger import get_logger  # noqa: E402
 from sequoia_x.data.snapshot import MarketSnapshot  # noqa: E402
+from sequoia_x.strategy.filters import tradable_mask  # noqa: E402
 from sequoia_x.strategy.registry import STRATEGIES  # noqa: E402
 
 logger = get_logger(__name__)
@@ -104,12 +105,29 @@ def add_forward_returns(df: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
     return df
 
 
-def market_forward_returns(df: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
-    """每个交易日的全市场等权基准收益（中位数，抗极端值）。"""
+def market_forward_returns(
+    df: pd.DataFrame, horizons: list[int], universe: pd.Series | None = None
+) -> pd.DataFrame:
+    """每个交易日的等权基准收益（**均值**）。
+
+    Args:
+        df: 含 ``date`` 与 ``fwd_h`` 列的行情表。
+        horizons: 持有期列表。
+
+    为什么用均值而不是中位数：等权买入可交易池得到的收益就是**均值**。A 股收益右偏
+    （少数暴涨股拉高均值），用中位数当基准会系统性低估基准，把"跑输均值"误判成"超额"。
+        universe: 可交易池掩码。**应该传**——否则基准里会混进 ST、低流动性、涨停
+            这些本来就买不到的票；2024–2026 年这类票整体跑赢，会把策略的"超额"吹大。
+
+    Returns:
+        索引为日期、列为 ``mkt_h`` 的 DataFrame。
+    """
     frame = df[["date"]].copy()
     for h in horizons:
         frame[f"mkt_{h}"] = df[f"fwd_{h}"]
-    return frame.groupby("date").median()
+    if universe is not None:
+        frame = frame[pd.Series(universe).fillna(False).to_numpy(dtype=bool)]
+    return frame.groupby("date").mean()
 
 
 # ── 信号 ──
@@ -295,8 +313,8 @@ def main(argv: list[str] | None = None) -> None:
     df = load_history(db_path)
     df = attach_st_flag(df, db_path)
     df = add_forward_returns(df, horizons)
-    market = market_forward_returns(df, horizons)
     snap = build_snapshot(df)
+    market = market_forward_returns(df, horizons, universe=tradable_mask(snap, settings))
     print(
         f"{len(df):,} 行 / {df['symbol'].nunique():,} 只 / {df['date'].min()} ~ {df['date'].max()}"
     )
