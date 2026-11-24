@@ -52,6 +52,15 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+#: 记录每只股票"已知的历史下界"：往前补齐时，已经证明没有更早数据的股票直接跳过，
+#: 否则"2024 年才上市"的股票每轮都会被重新拉一次空区间，任务集永远不收敛。
+_CREATE_FLOOR_SQL = """
+CREATE TABLE IF NOT EXISTS history_floor (
+    symbol TEXT PRIMARY KEY,
+    floor  TEXT NOT NULL
+);
+"""
+
 
 def _bs_login(bs) -> bool:
     """登录 baostock；任何异常都当成失败返回 False。"""
@@ -113,7 +122,14 @@ def _bs_fetch_batch(task: tuple) -> tuple[list, dict]:
     items, deadline, stop_flag = task[:3]
     verbose = bool(task[3]) if len(task) > 3 else False
     rows: list[list[str]] = []
-    stats = {"ok": 0, "empty": 0, "failed": 0, "aborted": 0, "reconnects": 0}
+    stats = {
+        "ok": 0,
+        "empty": 0,
+        "failed": 0,
+        "aborted": 0,
+        "reconnects": 0,
+        "empty_ranges": [],
+    }
 
     if not _bs_login(bs):
         stats["aborted"] = len(items)
@@ -164,6 +180,7 @@ def _bs_fetch_batch(task: tuple) -> tuple[list, dict]:
             stats["ok"] += 1
             if got == 0:
                 stats["empty"] += 1
+                stats["empty_ranges"].append((symbol, start))
             if verbose and (index + 1) % 200 == 0:
                 print(
                     f"    [worker] {index + 1}/{len(items)} "
@@ -253,6 +270,7 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_FLOOR_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -447,6 +465,7 @@ class DataEngine:
         max_seconds: float | None,
         workers: int | None,
         label: str,
+        record_floor: bool = False,
     ) -> int:
         """把任务分片交给多进程拉取，清洗后幂等写入 stock_daily。
 
@@ -455,6 +474,8 @@ class DataEngine:
             max_seconds: 时间预算；None 用配置值。
             workers: 并发进程数；None 用配置值。
             label: 日志里用的动作名（"同步" / "向前补齐"）。
+            record_floor: 为 True 时，把"区间内没有数据"的股票写入 ``history_floor``，
+                这样下次构建任务时不必重复拉取。
 
         Returns:
             实际写入（或更新）的行数。
@@ -497,10 +518,15 @@ class DataEngine:
         elapsed = time.monotonic() - started
         all_rows: list = []
         totals = {"ok": 0, "empty": 0, "failed": 0, "aborted": 0, "reconnects": 0}
+        empty_ranges: list[tuple[str, str]] = []
         for batch_rows, batch_stats in results:
             all_rows.extend(batch_rows)
             for key in totals:
                 totals[key] += batch_stats.get(key, 0)
+            empty_ranges.extend(batch_stats.get("empty_ranges", []))
+
+        if record_floor and empty_ranges:
+            self._record_floors(empty_ranges)
 
         logger.info(
             f"{label}结束（{elapsed:.1f}s）：成功 {totals['ok']} | 无数据 {totals['empty']} | "
@@ -541,25 +567,62 @@ class DataEngine:
         )
         return count
 
+    def _record_floors(self, empty_ranges: list[tuple[str, str]]) -> None:
+        """把"区间内没有数据"的股票记入 ``history_floor``。
+
+        记录的是**本次尝试的起点**：下次若目标日不早于它，说明这段区间已经验证过为空，直接跳过；
+        若用户把目标日前移（例如 2015 → 2010），则仍会重新尝试。
+
+        Args:
+            empty_ranges: ``(symbol, 本次尝试的起点)`` 列表。
+        """
+        rows = [(symbol, start) for symbol, start in empty_ranges]
+        if not rows:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO history_floor (symbol, floor) VALUES (?, ?) "
+                "ON CONFLICT(symbol) DO UPDATE SET floor = excluded.floor",
+                rows,
+            )
+            conn.commit()
+        logger.info(f"记录 {len(rows)} 只股票的已知历史下界（避免重复拉空区间）")
+
+    def _load_floors(self) -> dict[str, str]:
+        """读取已知的历史下界 ``{symbol: floor}``。"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute("SELECT symbol, floor FROM history_floor").fetchall()
+        except sqlite3.Error:
+            return {}
+        return {row[0]: row[1] for row in rows}
+
     @staticmethod
     def build_extend_tasks(
-        rows: list[tuple[str, str]], start_date: str
+        rows: list[tuple[str, str]],
+        start_date: str,
+        floors: dict[str, str] | None = None,
     ) -> list[tuple[str, str, str, str]]:
         """根据每只股票的最早日期，生成"向前补齐"的任务列表。
 
         Args:
             rows: ``(symbol, 库内最早日期)`` 列表。
             start_date: 目标起点（YYYY-MM-DD）。
+            floors: 已知的历史下界（``{symbol: floor}``），用于跳过反复拉空的股票。
 
         Returns:
             ``(symbol, bs_code, start, end)`` 列表；已经早于 ``start_date`` 的股票会被跳过。
         """
         from datetime import date, timedelta
 
+        floors = floors or {}
         tasks = []
         for symbol, first_date in rows:
             if not first_date or first_date <= start_date:
                 continue
+            floor = floors.get(symbol)
+            if floor and floor <= start_date:
+                continue  # 已知没有更早的数据（没有记录时按"未知"处理，不能跳过）
             end = (date.fromisoformat(first_date) - timedelta(days=1)).strftime("%Y-%m-%d")
             if end < start_date:
                 continue
@@ -598,13 +661,17 @@ class DataEngine:
             wanted = set(symbols)
             rows = [r for r in rows if r[0] in wanted]
 
-        tasks = self.build_extend_tasks(rows, start_date)
+        tasks = self.build_extend_tasks(rows, start_date, self._load_floors())
         if not tasks:
-            logger.info(f"所有股票的历史起点都已早于 {start_date}，无需补齐")
-            return 0
+            logger.info(f"所有股票的历史起点都已早于 {start_date}（或已确认无更早数据），无需补齐")
+            return -1
         logger.info(f"需要向前补齐 {len(tasks)} 只股票（目标起点 {start_date}）")
         return self._run_fetch(
-            tasks, max_seconds=max_seconds, workers=workers, label="向前补齐"
+            tasks,
+            max_seconds=max_seconds,
+            workers=workers,
+            label="向前补齐",
+            record_floor=True,
         )
 
     def backfill(self, symbols: list[str], max_seconds: float | None = None) -> dict:

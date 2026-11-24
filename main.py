@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> None:
                     workers=args.workers,
                     symbols=engine.universe,
                 )
-                if written == 0:
+                if written < 0:
                     break
                 logger.info(
                     f"第 {index + 1} 轮补齐写入 {written} 行"

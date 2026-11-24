@@ -212,3 +212,21 @@ def test_build_extend_tasks_skips_already_covered() -> None:
 
 def test_build_extend_tasks_empty() -> None:
     assert DataEngine.build_extend_tasks([], "2015-01-01") == []
+
+
+def test_build_extend_tasks_respects_floors() -> None:
+    """已知没有更早数据的股票（floor 早于目标日）应被跳过，避免每轮重复拉空。"""
+    rows = [("600000", "2024-01-02"), ("000001", "2024-01-02")]
+    floors = {"600000": "2015-01-01"}
+
+    tasks = DataEngine.build_extend_tasks(rows, "2015-01-01", floors)
+    assert tasks == [("000001", "sz.000001", "2015-01-01", "2024-01-01")]
+
+
+def test_build_extend_tasks_floor_does_not_hide_older_gaps() -> None:
+    """若 floor 晚于目标日，说明还有更早的数据可补，不应跳过。"""
+    rows = [("600000", "2020-01-02")]
+    floors = {"600000": "2019-01-01"}
+
+    tasks = DataEngine.build_extend_tasks(rows, "2015-01-01", floors)
+    assert tasks == [("600000", "sh.600000", "2015-01-01", "2020-01-01")]
