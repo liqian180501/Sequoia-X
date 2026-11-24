@@ -110,7 +110,8 @@ def _bs_fetch_batch(task: tuple) -> tuple[list, dict]:
 
     import baostock as bs
 
-    items, deadline, stop_flag = task
+    items, deadline, stop_flag = task[:3]
+    verbose = bool(task[3]) if len(task) > 3 else False
     rows: list[list[str]] = []
     stats = {"ok": 0, "empty": 0, "failed": 0, "aborted": 0, "reconnects": 0}
 
@@ -163,6 +164,12 @@ def _bs_fetch_batch(task: tuple) -> tuple[list, dict]:
             stats["ok"] += 1
             if got == 0:
                 stats["empty"] += 1
+            if verbose and (index + 1) % 200 == 0:
+                print(
+                    f"    [worker] {index + 1}/{len(items)} "
+                    f"ok={stats['ok']} fail={stats['failed']}",
+                    flush=True,
+                )
     finally:
         try:
             bs.logout()
@@ -469,7 +476,9 @@ class DataEngine:
 
         deadline = time.monotonic() + budget
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
-        payload = [(chunk, deadline, _StopFlag()) for chunk in chunks]
+        payload = [
+            (chunk, deadline, _StopFlag(), label == "向前补齐") for chunk in chunks
+        ]
 
         started = time.monotonic()
         results: list = []
