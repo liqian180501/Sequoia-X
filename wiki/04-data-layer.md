@@ -263,6 +263,19 @@ def get_ohlcv(self, symbol: str) -> pd.DataFrame:      # engine.py:80
 > ⚠️ **v2 起策略层不再走这条路径**。`get_ohlcv()` 保留给"单只股票诊断/调试"用（见 [10 HOWTO 配方 7](10-how-to-recipes.md)），
 > 策略改用下面的 `get_snapshot()`。
 
+### 4.3.1 路径 E：`extend_history(start_date)` — 向前补齐
+
+`sync_today_bulk` 补"最新之后"，`backfill` 补区间缺口，`extend_history` 补**最早之前**：
+
+```python
+rows = SELECT symbol, MIN(date) FROM stock_daily GROUP BY symbol
+tasks = build_extend_tasks(rows, "2015-01-01")   # 区间 [目标日, MIN(date)-1]
+return self._run_fetch(tasks, ..., label="向前补齐")   # 同一个 worker / 预算 / 幂等 upsert
+```
+
+三条写入路径现在共用 `_run_fetch()`：同一套"分片 → 多进程拉 → 预算收工 → 清洗 → upsert"，
+所以重连、早停、幂等这些性质对补齐同样生效。
+
 ### 4.4 路径 D：`get_snapshot()` — 全市场快照（v2 推荐，策略层唯一入口）
 
 ```python

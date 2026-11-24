@@ -126,6 +126,26 @@ python main.py --dry-run       # 只选股、不推送
 > ⚠️ **默认模式不只是"补今天"**：它会为每只股票补从 `MAX(date)+1` 到今天的**所有缺口**。
 > 停机一周后跑一次会自动补一周（受时间预算限制，可能需要 `--sync-rounds`）。
 
+### 5.0.-1 扩大历史数据集（向前补齐）
+
+默认 `START_DATE=2024-01-01`，所以库里的起点被截断在 2024。想把样本往前扩：
+
+```bash
+python main.py --extend-history 2015-01-01 --sync-rounds 8 --sync-timeout 1800
+python main.py --extend-history 2015-01-01 --symbols 600000,000001 --dry-run  # 先小规模验证
+```
+
+| 特点 | 说明 |
+|---|---|
+| 只补"起点之前" | 与 `sync_today_bulk`（补最新之后）和 `--backfill`（补缺口）互补 |
+| 可中断续传 | 任务由每只股票的 `MIN(date)` 生成，已补到位的自动跳过 |
+| 有预算 | 每轮按时长收工，`--sync-rounds` 控制最多跑几轮 |
+| 吞吐 | 实测 4 进程约 **1.8 秒/只**（5 年区间、约 1,000 行/只）→ 全市场约 2.5 小时 |
+| 代价 | 每只股票多约 1,000~2,000 行，全市场约 **+1,000 万行 / +1.5 GB** |
+
+> 补完会让**回测样本**从 700 个交易日扩到约 2,800 个（含 2015 股灾、2018 熊市、2020 疫情），
+> 对参数稳健性判断价值很大；但日常跑批不受影响（策略只读最近 130 天）。
+
 ### 5.0.0 回测
 
 ```bash
@@ -153,6 +173,7 @@ python scripts/backtest.py --strategy turtle,rps --horizons 1,5,10
 | `--symbols CODES` / `--symbols-file PATH` | 自选股模式，只对这些股票选股 |
 | `--list-strategies` | 打印策略标识与说明后退出 |
 | `--backfill` | 回填历史（不选股、不推送） |
+| `--extend-history YYYY-MM-DD` | 把历史**起点往前**补到该日期（可反复运行续传） |
 | `--sync-rounds N` | 最多分 N 轮同步，每轮用一次预算（停机多天后补齐用） |
 | `--sync-timeout SEC` | 本轮同步的时间预算，默认 `SYNC_MAX_SECONDS`（240） |
 | `--workers N` | 同步并发进程数，默认 `SYNC_WORKERS`（4） |
