@@ -63,7 +63,7 @@ settings = get_settings()                       # 1. 读 .env / 环境变量 →
 logger   = get_logger(__name__)                 # 2. rich 日志
 engine   = DataEngine(settings)                 # 3. 建库建表（幂等）
 count    = engine.sync_today_bulk()             # 4. 8 进程并行补数据 → 3.5M 行的表
-strategies = [ MaVolumeStrategy(...), ... ]     # 5. 实例化 9 个策略
+strategies = [ MaVolumeStrategy(...), ... ]     # 5. 实例化 8 个策略
 notifier = FeishuNotifier(settings)             # 6. 推送器
 for s in strategies:                            # 7. 逐个跑，有结果就推送
     selected = s.run()

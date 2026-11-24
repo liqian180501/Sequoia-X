@@ -108,7 +108,7 @@ python main.py --dry-run       # 只选股、不推送
 流程（详见 [01](01-overview.md#3-一次日常运行的完整时序)）：
 
 ```
-（可选）同步增量 → 9 个策略串行跑 → 每个有结果的策略发一张飞书卡片 → 打印汇总表
+（可选）同步增量 → 8 个策略串行跑 → 每个有结果的策略发一张飞书卡片 → 打印汇总表
 ```
 
 **预期耗时**：
@@ -125,6 +125,16 @@ python main.py --dry-run       # 只选股、不推送
 
 > ⚠️ **默认模式不只是"补今天"**：它会为每只股票补从 `MAX(date)+1` 到今天的**所有缺口**。
 > 停机一周后跑一次会自动补一周（受时间预算限制，可能需要 `--sync-rounds`）。
+
+### 5.0.0 回测
+
+```bash
+python scripts/backtest.py                                    # 全部策略，扣成本
+python scripts/backtest.py --horizons 1,5 --top 30 --train-end 2026-01-01
+python scripts/backtest.py --strategy turtle,rps --horizons 1,5,10
+```
+口径：T 日收盘算信号、**T+1 开盘买入**、T+h 收盘卖出、往返成本 0.2%、基准为同日全市场等权。
+详见 [05 §7](05-strategy-system.md)。
 
 ### 5.0 命令行速查
 

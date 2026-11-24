@@ -10,7 +10,7 @@
 每天收盘后跑一次 `python main.py`：
 
 ```
-从 baostock 补当天行情 → 存入本地 SQLite → 9 个选股策略各扫一遍全市场 5224 只股票
+从 baostock 补当天行情 → 存入本地 SQLite → 8 个选股策略各扫一遍全市场 5224 只股票
 → 命中结果的策略各自推一条飞书卡片到对应的机器人
 ```
 
@@ -51,7 +51,7 @@ python main.py --dry-run --push-now  # 只看结果不推送
 | [02 Python 速成（Java 视角）](02-python-for-java-devs.md) | 语法/对象模型/模块/异常/打包，全部对照 Java 概念 |
 | [03 pandas 实战手册](03-pandas-field-guide.md) | DataFrame 心智模型 + 本项目用到的每一个 pandas API |
 | [04 数据层 DataEngine](04-data-layer.md) | 表结构、baostock 对接、三种同步路径、多进程模型、容错 |
-| [05 策略系统](05-strategy-system.md) | BaseStrategy 契约 + 通用过滤层 + 9 个策略的设计与阈值 |
+| [05 策略系统](05-strategy-system.md) | BaseStrategy 契约 + 通用过滤层 + 8 个策略的设计与阈值 |
 | [06 配置与通知](06-config-and-notify.md) | pydantic-settings、环境变量优先级、Webhook 路由、飞书卡片 |
 | [07 运行与运维](07-run-and-ops.md) | 安装、回填、日常运行、cron、故障排查表 |
 | [08 测试与质量](08-testing-and-quality.md) | pytest + hypothesis 属性测试、ruff、如何跑 |
