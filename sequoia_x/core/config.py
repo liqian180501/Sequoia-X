@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     #: 是否剔除 ST / *ST / 退市股
     exclude_st: bool = True
 
+    # ── 运维告警（P2-7）──
+    #: 告警专用 Webhook（可独立于选股群）。留空则告警只写日志，不推送
+    alert_webhook_url: str | None = None
+    #: 数据新鲜度容忍：行情最新日期距"应有交易日"最多落后几天
+    max_data_lag_days: int = Field(default=1, ge=0)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
