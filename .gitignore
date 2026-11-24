@@ -36,3 +36,7 @@ build/
 
 # Hypothesis 测试缓存
 .hypothesis/
+
+# 生成产物（backtest --out、无头截图等）
+data/*.json
+.shots/

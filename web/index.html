@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sequoia-X 控制台</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171c22; --panel2: #1e252d; --line: #2b343e;
+    --text: #e6edf3; --muted: #8b98a5; --up: #f05252; --down: #2ea043;
+    --accent: #3b82f6; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; padding: 16px 24px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav button {
+    background: transparent; border: 1px solid transparent; color: var(--muted);
+    padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.active { background: var(--panel2); color: var(--text); border-color: var(--line); }
+  main { padding: 20px 24px 60px; max-width: 1400px; margin: 0 auto; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 2px; }
+  .card .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  h2 { font-size: 15px; margin: 26px 0 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: var(--panel2); color: var(--muted); }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .btn {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 8px 16px; font-size: 13px; cursor: pointer;
+  }
+  .btn:hover { filter: brightness(1.1); } .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--line); }
+  .btn.danger { background: #b91c1c; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .spacer { flex: 1; }
+  label.chk { display: inline-flex; gap: 6px; align-items: center; background: var(--panel2);
+    border: 1px solid var(--line); padding: 5px 10px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .muted { color: var(--muted); }
+  .stat { font-size: 13px; color: var(--muted); }
+  .ok { color: var(--down); } .err { color: var(--up); }
+  #log { font-size: 12px; color: var(--muted); min-height: 20px; margin-top: 10px; }
+  .hidden { display: none !important; }
+  .strat-block { margin-bottom: 18px; }
+  .strat-head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
+  .strat-head .name { font-weight: 600; }
+  input[type=text] {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 8px 12px; width: 150px; font-size: 13px;
+  }
+  svg text { fill: var(--muted); font-size: 10px; }
+  .chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sequoia-X <span class="sub">A 股量化选股 · 本地控制台</span></h1>
+  <nav>
+    <button data-tab="overview" class="active">总览</button>
+    <button data-tab="select">选股</button>
+    <button data-tab="kline">行情</button>
+    <button data-tab="backtest">回测</button>
+  </nav>
+</header>
+
+<main>
+  <!-- 总览 -->
+  <section id="tab-overview">
+    <div class="grid" id="cards"></div>
+    <h2>策略清单</h2>
+    <table id="strategy-table">
+      <thead><tr><th>标识</th><th>类名</th><th>说明</th><th>需要K线</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h2>配置</h2>
+    <table id="config-table"><tbody></tbody></table>
+  </section>
+
+  <!-- 选股 -->
+  <section id="tab-select" class="hidden">
+    <div class="row">
+      <strong>选择策略：</strong>
+      <div id="strategy-checks" class="row"></div>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btn-all">全选</button>
+      <button class="btn ghost" id="btn-none">全不选</button>
+      <label class="chk"><input type="checkbox" id="chk-limit" checked> 每个策略最多 30 只</label>
+      <button class="btn" id="btn-run">运行选股</button>
+      <button class="btn danger" id="btn-push" disabled>推送到飞书</button>
+    </div>
+    <div id="log"></div>
+    <div id="select-result"></div>
+  </section>
+
+  <!-- 行情 -->
+  <section id="tab-kline" class="hidden">
+    <div class="row">
+      <input type="text" id="symbol" placeholder="600000" maxlength="6" />
+      <button class="btn" id="btn-kline">查看</button>
+      <span class="muted" id="kline-title"></span>
+    </div>
+    <div id="log-kline" class="stat"></div>
+    <div class="chart-wrap" style="margin-top:12px"><svg id="chart" width="100%" height="440"></svg></div>
+  </section>
+
+  <!-- 回测 -->
+  <section id="tab-backtest" class="hidden">
+    <div class="row">
+      <button class="btn" id="btn-backtest">加载回测结果</button>
+      <span class="muted">数据来自 <code>data/backtest_summary.json</code>（由 <code>scripts/backtest.py --out</code> 生成）</span>
+    </div>
+    <div id="backtest-body" style="margin-top:14px"></div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const api = async (path, opts = {}) => {
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+};
+const fmt = (v, digits = 2) => (v === null || v === undefined ? "—" : Number(v).toFixed(digits));
+const pctCls = (v) => (v === null || v === undefined ? "" : v > 0 ? "up" : v < 0 ? "down" : "");
+const log = (msg, cls = "") => { const el = $("#log"); el.className = "stat " + cls; el.textContent = msg; };
+
+/* ── 标签切换 ── */
+function showTab(name) {
+  const btn = document.querySelector(`nav button[data-tab="${name}"]`);
+  if (!btn) return;
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
+  ["overview", "select", "kline", "backtest"].forEach((t) =>
+    $("#tab-" + t).classList.toggle("hidden", t !== name));
+  history.replaceState(null, "", "#" + name);
+}
+document.querySelectorAll("nav button").forEach((btn) => {
+  btn.onclick = () => showTab(btn.dataset.tab);
+});
+
+/* ── 总览 ── */
+async function loadStatus() {
+  const s = await api("/api/status");
+  const db = s.db;
+  const cards = [
+    ["行情行数", db.rows.toLocaleString(), "行"],
+    ["股票数", db.symbols, "只"],
+    ["交易日", db.trading_days, "天"],
+    ["数据区间", `${db.first_date} ~ ${db.last_date}`, ""],
+    ["库大小", db.size_mb, "MB"],
+    ["落后股票", db.stale_symbols ?? "—", "只"],
+    ["上次运行", s.last_run ? s.last_run.took_s + "s" : "未运行", ""],
+    ["服务器时间", s.server_time.slice(11), ""],
+  ];
+  $("#cards").innerHTML = cards.map(([k, v, u]) =>
+    `<div class="card"><div class="k">${k}</div><div class="v">${v} <small>${u}</small></div></div>`).join("");
+
+  $("#strategy-table tbody").innerHTML = s.strategies.map((x) =>
+    `<tr><td><code>${x.key}</code></td><td>${x.name}</td><td class="muted">${x.doc}</td>
+     <td>${x.needs_market_data ? "是" : "否"}</td></tr>`).join("");
+
+  const cfg = s.settings;
+  $("#config-table tbody").innerHTML = Object.entries(cfg).map(([k, v]) =>
+    `<tr><td class="muted">${k}</td><td>${v}</td></tr>`).join("");
+
+  $("#strategy-checks").innerHTML = s.strategies.map((x) =>
+    `<label class="chk"><input type="checkbox" value="${x.key}" checked> ${x.key}</label>`).join("");
+  return s;
+}
+
+/* ── 选股 ── */
+function selectedKeys() {
+  return [...document.querySelectorAll("#strategy-checks input:checked")].map((i) => i.value);
+}
+
+async function runSelect() {
+  const keys = selectedKeys();
+  if (!keys.length) { log("请至少选择一个策略", "err"); return; }
+  $("#btn-run").disabled = true;
+  log("正在计算（首次会加载快照，约 5 秒）…");
+  try {
+    const limit = $("#chk-limit").checked ? 30 : 0;
+    const data = await api("/api/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ strategies: keys, limit }),
+    });
+    renderSelect(data);
+    $("#btn-push").disabled = false;
+    log(`完成：${data.results.length} 个策略，耗时 ${data.took_s}s，快照日期 ${data.snapshot.last_date}`, "ok");
+  } catch (e) {
+    log("失败：" + e.message, "err");
+  } finally {
+    $("#btn-run").disabled = false;
+  }
+}
+
+function renderSelect(data) {
+  const total = data.results.reduce((n, r) => n + r.count, 0);
+  let html = `<h2>共 ${total} 只 · 快照 ${data.snapshot.symbols} 只 / ${data.snapshot.rows.toLocaleString()} 行</h2>`;
+  for (const r of data.results) {
+    html += `<div class="strat-block"><div class="strat-head">
+      <span class="name">${r.name}</span>
+      <span class="pill">${r.key}</span>
+      <span class="pill">${r.count} 只</span>
+      <span class="stat">${r.elapsed_s}s</span>
+      ${r.error ? `<span class="err">${r.error}</span>` : ""}
+    </div>`;
+    if (!r.rows.length) {
+      html += `<div class="muted" style="padding:4px 10px">今日无符合条件的股票</div></div>`;
+      continue;
+    }
+    html += `<table><thead><tr><th class="num">#</th><th>代码</th><th>名称</th>
+      <th class="num">收盘</th><th class="num">涨跌幅</th><th class="num">成交额(亿)</th></tr></thead><tbody>`;
+    r.rows.forEach((x, i) => {
+      html += `<tr><td class="num muted">${i + 1}</td>
+        <td><a href="#" data-symbol="${x.symbol}" class="sym" style="color:inherit">${x.symbol}</a></td>
+        <td>${x.name || "—"}</td>
+        <td class="num">${fmt(x.close)}</td>
+        <td class="num ${pctCls(x.pct)}">${x.pct === null || x.pct === undefined ? "—" : (x.pct > 0 ? "+" : "") + fmt(x.pct) + "%"}</td>
+        <td class="num">${fmt(x.turnover)}</td></tr>`;
+    });
+    html += `</tbody></table></div>`;
+  }
+  $("#select-result").innerHTML = html;
+  document.querySelectorAll("a.sym").forEach((a) => {
+    a.onclick = (ev) => {
+      ev.preventDefault();
+      $("#symbol").value = a.dataset.symbol;
+      document.querySelector('nav button[data-tab="kline"]').click();
+      loadKline();
+    };
+  });
+}
+
+async function pushLast() {
+  if (!confirm("确认把上一次选股结果推送到飞书群？")) return;
+  $("#btn-push").disabled = true;
+  try {
+    const data = await api("/api/push", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true, strategies: selectedKeys() }),
+    });
+    log(`已推送 ${data.sent.length} 条：` + data.sent.map((s) => `${s.key}(${s.count})`).join("、"), "ok");
+  } catch (e) {
+    log("推送失败：" + e.message, "err");
+  } finally {
+    $("#btn-push").disabled = false;
+  }
+}
+
+/* ── K 线 ── */
+async function loadKline() {
+  const symbol = ($("#symbol").value || "").trim();
+  if (!/^\d{6}$/.test(symbol)) { $("#log-kline").textContent = "请输入 6 位股票代码"; return; }
+  $("#log-kline").textContent = "加载中…";
+  try {
+    const data = await api(`/api/kline?symbol=${symbol}&limit=120`);
+    $("#kline-title").textContent = `${data.symbol} ${data.name || ""} · ${data.bars.length} 根日线`;
+    $("#log-kline").textContent = "";
+    drawChart(data.bars);
+  } catch (e) {
+    $("#log-kline").textContent = "失败：" + e.message;
+  }
+}
+
+const W = 1200, H = 440, PAD_L = 8, PAD_R = 60, PRICE_H = 320, VOL_H = 70, GAP = 14;
+function drawChart(bars) {
+  const svg = $("#chart");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = "";
+  if (!bars.length) return;
+  const n = bars.length;
+  const innerW = W - PAD_L - PAD_R;
+  const step = innerW / n;
+  const hi = Math.max(...bars.map((b) => b.h)), lo = Math.min(...bars.map((b) => b.l));
+  const pad = (hi - lo) * 0.06 || 1;
+  const y = (p) => PRICE_H - ((p - (lo - pad)) / ((hi - pad) - (lo - pad))) * (PRICE_H - 10) + 6;
+  const vmax = Math.max(...bars.map((b) => b.v)) || 1;
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs) => { const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]); svg.appendChild(e); return e; };
+
+  // 网格与价格刻度
+  for (let i = 0; i <= 4; i++) {
+    const p = lo + ((hi - lo) * i) / 4;
+    const yy = y(p);
+    el("line", { x1: PAD_L, y1: yy, x2: W - PAD_R, y2: yy, stroke: "#222b35", "stroke-width": 1 });
+    const t = el("text", { x: W - PAD_R + 6, y: yy + 3 });
+    t.textContent = p.toFixed(2);
+  }
+  // 蜡烛
+  bars.forEach((b, i) => {
+    const cx = PAD_L + step * (i + 0.5);
+    const up = b.c >= b.o;
+    const color = up ? "#f05252" : "#2ea043";
+    const bw = Math.max(1.2, step * 0.62);
+    el("line", { x1: cx, y1: y(b.h), x2: cx, y2: y(b.l), stroke: color, "stroke-width": 1 });
+    const top = y(Math.max(b.o, b.c)), bot = y(Math.min(b.o, b.c));
+    el("rect", { x: cx - bw / 2, y: top, width: bw, height: Math.max(1, bot - top), fill: color });
+    const vh = (b.v / vmax) * VOL_H;
+    el("rect", { x: cx - bw / 2, y: PRICE_H + GAP + VOL_H - vh, width: bw, height: vh,
+      fill: color, opacity: 0.55 });
+  });
+  // MA20
+  const ma = [];
+  for (let i = 0; i < n; i++) {
+    if (i < 19) { ma.push(null); continue; }
+    const slice = bars.slice(i - 19, i + 1);
+    ma.push(slice.reduce((s, b) => s + b.c, 0) / 20);
+  }
+  const pts = ma.map((v, i) => v === null ? null : `${PAD_L + step * (i + 0.5)},${y(v)}`).filter(Boolean).join(" ");
+  el("polyline", { points: pts, fill: "none", stroke: "#d29922", "stroke-width": 1.4, opacity: 0.9 });
+  // 日期刻度
+  [0, Math.floor(n / 2), n - 1].forEach((i) => {
+    const t = el("text", { x: PAD_L + step * (i + 0.5), y: PRICE_H + GAP + VOL_H + 18 });
+    t.setAttribute("text-anchor", i === 0 ? "start" : i === n - 1 ? "end" : "middle");
+    t.textContent = bars[i].d.slice(2);
+  });
+  const last = bars[n - 1];
+  const t2 = el("text", { x: PAD_L, y: 14 });
+  t2.textContent = `最新 ${last.d}  收 ${last.c.toFixed(2)}  MA20 ${ma[n - 1] ? ma[n - 1].toFixed(2) : "—"}`;
+}
+
+/* ── 回测 ── */
+async function loadBacktest() {
+  const data = await api("/api/backtest");
+  if (!data.available) {
+    $("#backtest-body").innerHTML = `<div class="muted">还没有回测结果。运行：
+      <code>python scripts/backtest.py --horizons 1,5 --top 30 --train-end 2023-01-01 --out data/backtest_summary.json</code></div>`;
+    return;
+  }
+  const rows = data.data.rows || [];
+  if (!rows.length) { $("#backtest-body").textContent = "结果为空"; return; }
+  let html = `<div class="muted" style="margin-bottom:8px">${data.data.meta || ""}</div>
+    <table><thead><tr><th>策略</th><th>区间</th><th class="num">笔数</th>
+    <th class="num">h1 超额</th><th class="num">h5 超额</th><th class="num">年化</th>
+    <th class="num">回撤</th><th class="num">夏普</th></tr></thead><tbody>`;
+  for (const r of rows) {
+    html += `<tr><td>${r.strategy}</td><td>${r.block}</td><td class="num">${r.trades}</td>
+      <td class="num ${pctCls(r.h1_exc)}">${fmt(r.h1_exc)}</td>
+      <td class="num ${pctCls(r.h5_exc)}">${fmt(r.h5_exc)}</td>
+      <td class="num ${pctCls(r.annual)}">${fmt(r.annual, 1)}</td>
+      <td class="num">${fmt(r.mdd, 1)}</td><td class="num">${fmt(r.sharpe)}</td></tr>`;
+  }
+  $("#backtest-body").innerHTML = html + "</tbody></table>";
+}
+
+/* ── 绑定与初始化 ── */
+$("#btn-run").onclick = runSelect;
+$("#btn-push").onclick = pushLast;
+$("#btn-all").onclick = () => document.querySelectorAll("#strategy-checks input").forEach((i) => (i.checked = true));
+$("#btn-none").onclick = () => document.querySelectorAll("#strategy-checks input").forEach((i) => (i.checked = false));
+$("#btn-kline").onclick = loadKline;
+$("#symbol").addEventListener("keydown", (e) => { if (e.key === "Enter") loadKline(); });
+$("#btn-backtest").onclick = loadBacktest;
+
+const initialTab = (location.hash || "#overview").slice(1);
+if (initialTab !== "overview") showTab(initialTab);
+
+loadStatus().then(() => {
+  if (initialTab === "kline" && !$("#symbol").value) { $("#symbol").value = "600000"; loadKline(); }
+  if (initialTab === "backtest") loadBacktest();
+}).catch((e) => { document.body.insertAdjacentHTML("afterbegin",
+  `<div style="padding:12px;color:#f05252">加载失败：${e.message}</div>`); });
+</script>
+</body>
+</html>

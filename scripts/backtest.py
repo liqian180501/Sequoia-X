@@ -25,6 +25,7 @@ python scripts/backtest.py --train-end 2026-01-01        # 样本内/样本外�
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -245,6 +246,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--start", default=None, help="回测起始日 YYYY-MM-DD")
     parser.add_argument(
+        "--out",
+        default=None,
+        help="把结果写成 JSON（供网页控制台读取），例如 data/backtest_summary.json",
+    )
+    parser.add_argument(
         "--train-end",
         default=None,
         help="样本内截止日；给了就把结果拆成「样本内 / 样本外」两块",
@@ -281,6 +287,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  {key:<18} 全部历史选股 {len(all_picks[key]):>7} 笔")
 
     start = args.start or str(df["date"].min())
+    records: list[dict] = []
+
     def run_block(label: str, lo: str, hi: str | None) -> None:
         print(f"\n===== {label}（{lo} ~ {hi or '最新'}）=====")
         rows = []
@@ -289,7 +297,21 @@ def main(argv: list[str] | None = None) -> None:
             picks = picks[picks["date"] >= lo]
             if hi:
                 picks = picks[picks["date"] < hi]
-            rows.append((key, evaluate(picks, df, market, horizons, cost=args.cost)))
+            metrics = evaluate(picks, df, market, horizons, cost=args.cost)
+            rows.append((key, metrics))
+            records.append(
+                {
+                    "strategy": key,
+                    "block": label,
+                    "trades": metrics.get("trades", 0),
+                    "days": metrics.get("days", 0),
+                    "h1_exc": metrics.get("h1_exc"),
+                    "h5_exc": metrics.get("h5_exc"),
+                    "annual": metrics.get("annual"),
+                    "mdd": metrics.get("mdd"),
+                    "sharpe": metrics.get("sharpe"),
+                }
+            )
         print_table(rows, horizons)
 
     # 基准：全市场等权
@@ -304,6 +326,20 @@ def main(argv: list[str] | None = None) -> None:
         run_block("样本外", args.train_end, None)
     else:
         run_block("全样本", start, None)
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = (
+            f"{df['date'].min()} ~ {df['date'].max()} · "
+            f"{df['symbol'].nunique()} 只 · 扣成本 {args.cost * 100:.2f}% · "
+            f"每日前 {args.top} 只"
+        )
+        out_path.write_text(
+            json.dumps({"meta": meta, "rows": records}, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        print(f"\n结果已写入 {out_path}")
 
 
 if __name__ == "__main__":
