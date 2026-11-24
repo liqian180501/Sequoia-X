@@ -27,6 +27,14 @@ class Settings(BaseSettings):                    # core/config.py:6
 | `start_date` | `START_DATE` | `2024-01-01` | 否 |
 | `feishu_webhook_url` | `FEISHU_WEBHOOK_URL` | 无 | **是** |
 | `snapshot_days` | `SNAPSHOT_DAYS` | `130`（最小 62） | 否 |
+| `sync_workers` | `SYNC_WORKERS` | `4` | 否 |
+| `sync_max_seconds` | `SYNC_MAX_SECONDS` | `240` | 否 |
+| `board_aware_limits` | `BOARD_AWARE_LIMITS` | `true` | 否 |
+| `min_turnover` | `MIN_TURNOVER` | `50000000`（5000 万） | 否 |
+| `min_price` | `MIN_PRICE` | `2.0` | 否 |
+| `min_history_bars` | `MIN_HISTORY_BARS` | `120` | 否 |
+| `max_picks` | `MAX_PICKS` | `30`（0=不限） | 否 |
+| `exclude_st` | `EXCLUDE_ST` | `true` | 否 |
 | `strategy_webhooks` | `STRATEGY_WEBHOOK_<KEY>`（动态） | `{}` | 否 |
 
 **Java 对照**：`Settings` ≈ 一个 `@ConfigurationProperties` 类 + `@NotBlank` 校验；`BaseSettings` 在实例化时读环境变量，读不到且无默认值就抛 `pydantic_core.ValidationError`。
@@ -119,7 +127,7 @@ load_dotenv()
 | 删掉 `load_dotenv()`，值只在 `.env` 里 | ✅ 仍然能读到 | ❌ **空字典** |
 | 值在真实环境变量里（Docker/K8s） | ✅ | ✅ |
 
-也就是说：**删掉 `load_dotenv()` 不会报错，只会让 7 个策略静默地全部推到同一个默认机器人**。这是典型的"沉默失败"，排查时先查这里。
+也就是说：**删掉 `load_dotenv()` 不会报错，只会让 9 个策略静默地全部推到同一个默认机器人**。这是典型的"沉默失败"，排查时先查这里。
 
 ### 3.4 `settings_customise_sources` 是死代码
 
@@ -152,7 +160,7 @@ def get_webhook_url(self, webhook_key: str) -> str:               # config.py:59
 - 查不到专属 URL 就 fallback 到默认机器人（**不会报错**）。
 - `webhook_key.lower()` 保证大小写不敏感。
 
-路由表（当前 7 个策略）：
+路由表（当前 9 个策略）：
 
 | `webhook_key` | 对应的环境变量 | 使用该键的策略 |
 |---|---|---|
@@ -162,6 +170,8 @@ def get_webhook_url(self, webhook_key: str) -> str:               # config.py:59
 | `shakeout` | `STRATEGY_WEBHOOK_SHAKEOUT` | `LimitUpShakeoutStrategy` |
 | `limit_down` | `STRATEGY_WEBHOOK_LIMIT_DOWN` | `UptrendLimitDownStrategy` |
 | `rps` | `STRATEGY_WEBHOOK_RPS` | `RpsBreakoutStrategy` |
+| `trend_pullback` | `STRATEGY_WEBHOOK_TREND_PULLBACK` | `TrendPullbackStrategy` |
+| `reversal_bounce` | `STRATEGY_WEBHOOK_REVERSAL_BOUNCE` | `ReversalBounceStrategy` |
 | `private_placement` | `STRATEGY_WEBHOOK_PRIVATE_PLACEMENT` | `PrivatePlacementStrategy` |
 | `default` | `FEISHU_WEBHOOK_URL` | 任何未覆盖 `webhook_key` 的策略 |
 
@@ -292,6 +302,8 @@ STRATEGY_WEBHOOK_FLAG=...
 STRATEGY_WEBHOOK_SHAKEOUT=...
 STRATEGY_WEBHOOK_LIMIT_DOWN=...
 STRATEGY_WEBHOOK_RPS=...
+STRATEGY_WEBHOOK_TREND_PULLBACK=...
+STRATEGY_WEBHOOK_REVERSAL_BOUNCE=...
 STRATEGY_WEBHOOK_PRIVATE_PLACEMENT=...
 ```
 
@@ -307,7 +319,7 @@ STRATEGY_WEBHOOK_PRIVATE_PLACEMENT=...
 | 现象 | 原因 |
 |---|---|
 | 启动即 `ValidationError: feishu_webhook_url Field required` | `.env` 没建，或变量名拼错 |
-| 7 个策略的卡片全发到同一个群 | `load_dotenv()` 被删，或 `.env` 里变量名拼错（如 `STRATEGY_WEBHOOK_MAVOLUME` 少了 `_`） |
+| 9 个策略的卡片全发到同一个群 | `load_dotenv()` 被删，或 `.env` 里变量名拼错（如 `STRATEGY_WEBHOOK_MAVOLUME` 少了 `_`） |
 | 日志 `飞书推送失败 [turtle] ... 飞书响应={"code":19021,...}` | webhook token 错/机器人被移出群 |
 | 卡片里股票名显示成 `SH600000` | `stock_info` 目录没有该代码（可能是北交所/新上市），或目录刷新失败 |
 | `Extra inputs are not permitted` | `extra="ignore"` 被删 |

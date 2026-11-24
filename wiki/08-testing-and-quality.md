@@ -254,13 +254,13 @@ def test_turtle_selects_on_breakout(tmp_path):
     })
     with patch.object(engine, "get_ohlcv", return_value=df), \
          patch.object(engine, "get_local_symbols", return_value=["600000"]), \
-         patch.object(TurtleTradeStrategy, "_get_market_caps", return_value={}):
+         # 策略只依赖 engine.get_snapshot()，用合成快照即可
         result = TurtleTradeStrategy(engine, settings).run()
 
     assert result == ["600000"]
 ```
 
-注意要 patch 掉 `_get_market_caps`，否则它会真的去连 baostock——这正是第 4.1 节说的"测试要隔离外部依赖"。
+注意策略只通过 `engine.get_snapshot()` 取数，所以用 mock 引擎 + 合成快照就能完全离线测试。
 
 ---
 

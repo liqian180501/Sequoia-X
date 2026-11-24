@@ -262,7 +262,7 @@ golden_cross = prev["ma5"] < prev["ma20"] and last["ma5"] > last["ma20"]
 
 方式二能跑，但要理解"NaN 参与比较永远 False"这个前提，否则看到没有 `isna` 判断会以为漏了。
 
-另外 `len(df) < 20: continue` 这种"数据不够就跳过"的守卫，在 7 个策略里每个都有（门槛 3 / 20 / 21 / 40 / 60 / 120 不等，见 [05](05-strategy-system.md)）。
+另外 `snap.enough_bars(n)` 这种"数据不够就跳过"的守卫，9 个策略里每个都有（门槛 3 / 21 / 40 / 61 / 62 / 120 不等，见 [05](05-strategy-system.md)）。
 
 ---
 

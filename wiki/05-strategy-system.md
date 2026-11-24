@@ -1,7 +1,7 @@
 # 05 · 策略系统
 
 > 目录：[sequoia_x/strategy/](../sequoia_x/strategy/)
-> 一句话职责：**给定每只股票的历史 K 线，判断它今天是否满足某个形态，返回代码列表。**
+> 一句话职责：**给定全市场最近 130 个交易日的行情，挑出今天值得关注的股票，按强度排序。**
 
 ---
 
@@ -14,539 +14,289 @@ class BaseStrategy(ABC):
     webhook_key: str = "default"                 # 路由键：决定推到哪个飞书机器人
 
     def __init__(self, engine: DataEngine, settings: Settings) -> None:
-        self.engine = engine                     # 数据访问
-        self.settings = settings                 # 配置访问
+        self.engine = engine
+        self.settings = settings
 
     @abstractmethod
     def run(self) -> list[str]:
         ...
 ```
 
-**子类必须做三件事**：
-
-1. 继承 `BaseStrategy`
-2. 覆盖 `webhook_key`（否则全部推到默认机器人）
-3. 实现 `run() -> list[str]`（返回纯数字代码，如 `['600519', '000001']`；无结果返回 `[]`）
-
-仅此而已。策略**不应该**自己发 HTTP、自己写库、自己读 `.env`——那些都是 `main.py` 和 `FeishuNotifier` 的事。这是标准的"策略只算、编排在外部"的分层。
+子类必须：继承 `BaseStrategy`、覆盖 `webhook_key`、实现 `run() -> list[str]`（默认按分数降序，最多 `max_picks` 只）。
+策略**不自己发 HTTP、不自己写库、不自己读 `.env`** —— 那些是 `main.py` 与 `FeishuNotifier` 的事。
 
 ---
 
-## 2. 六个策略共用的骨架（v2 批量向量化）
+## 2. 这一轮重写了什么（以及为什么）
 
-> **2026-11 性能改造（P0+P1）后的现状。**
-> 旧实现是"逐只 `get_ohlcv` + 逐只计算"，5 个策略各自把同一份行情读一遍（2.6 万次查询），
-> 实测占策略层耗时的 75%。现在改为**一次批量读 + 全市场向量化**，5 个策略共享同一份
-> `MarketSnapshot`，指标只算一次。
+七个旧策略的共同毛病：**只判断"形态像不像"，不管"能不能买、该不该买"，也不排序。**
 
-### 2.1 新的执行骨架
-
-```python
-def run(self) -> list[str]:
-    snap = self.engine.get_snapshot()          # ① 全市场最近 130 个交易日（进程内只加载一次）
-
-    ma5  = snap.rolling("close", 5)            # ② 按股票分组安全的滚动指标（带缓存，跨策略共享）
-    ma20 = snap.rolling("close", 20)
-    ma5_prev  = snap.rolling_shifted("close", 1, 5)    # "昨日 ma5"
-    ma20_prev = snap.rolling_shifted("close", 1, 20)
-
-    condition = (ma5_prev < ma20_prev) & (ma5 > ma20)  # ③ 全市场一次算完（布尔 Series）
-    selected = snap.latest(condition & snap.enough_bars(self._MIN_BARS))  # ④ 只取"每只股票最后一行"
-
-    logger.info(f"MaVolumeStrategy 选出 {len(selected)} 只股票")
-    return selected
-```
-
-### 2.2 为什么这样写
-
-| 设计 | 原因 |
-|---|---|
-| `engine.get_snapshot()` 而不是 `get_local_symbols()` + `get_ohlcv()` | 一条 SQL 取回 67 万行（≈2.6 s），替代 5,224 次单只查询（≈18.6 s） |
-| 指标缓存在 `MarketSnapshot` 实例上 | 7 个策略里 `MA20`、`20 日均量` 会被多次用到，只算一次 |
-| 不用 `groupby(...).transform(...)` | 每次分组都要回调进 Python，实测比"整列 rolling + 掩码"慢 **43 倍** |
-| `snap.latest(cond)` 而不是逐行判断 | 用 `cumcount(ascending=False) == 0` 直接定位每只股票的最后一行 |
-| `snap.enough_bars(n)` 代替 `if len(df) < n: continue` | 向量化版本：`bars >= n` 广播成整列布尔 |
-| **不再需要 `try/except` 包住单只股票** | 向量化后没有"单只"的概念；个别脏数据由 `NaN` 比较恒为 `False` 自然过滤 |
-
-> ⚠️ **语义差异（唯一一处）**：旧实现的 `_MIN_BARS` 判断的是该股票的**全部历史**行数，
-> 新实现判断的是**快照窗口（默认 130 个交易日）内**的行数。对长期停牌股，旧代码会拿陈旧数据
-> 参与计算，新代码因为窗口内行数不足而直接跳过——这更符合预期，但在极端情况下可能少选几只。
-> 用 `SNAPSHOT_DAYS`（默认 130）可调大窗口提高保真度。
-
-### 2.3 改造实测（同一份数据库，逐只比对）
-
-| 策略 | 改造前 | 改造后 | 选股结果 |
-|---|---:|---:|---|
-| MaVolume | 27.7 s | 4.6 s（含首次快照加载 4.5 s） | 15 只，**完全一致** |
-| TurtleTrade | 21.7 s | 0.05 s | 54 只，**完全一致** |
-| HighTightFlag | 21.1 s | 0.20 s | 0 只，**完全一致** |
-| LimitUpShakeout | 18.9 s | 0.02 s | 1 只，**完全一致** |
-| UptrendLimitDown | 25.2 s | 0.04 s | 2 只，**完全一致** |
-| RpsBreakout | 10.5 s | **1.5 s**（SQL 聚合，见第 8 节） | 208 只，**完全一致** |
-| **合计** | **125.1 s** | **6.4 s**（热跑，含快照 4.5 s） | 6/6 完全一致 |
-
-### `_MIN_BARS` 一览（这是理解"为什么某只票从不入选"的关键）
-
-| 策略 | `_MIN_BARS` | 说明 |
+| 策略 | 原来的不合理点 | 现在怎么做 |
 |---|---|---|
-| `LimitUpShakeout` | 3 | 只看最近 3 根 |
-| `HighTightFlag` | 40 | 40 日区间 + 20 日均量 |
-| `MaVolume` | **21** | 20 日均线 + 昨日一行（旧实现写的 20 偏小，已修正） |
-| `TurtleTrade` | 21 | 20 日窗口 + 今日 |
-| `UptrendLimitDown` | **61** | 60 日均线（昨日值）+ 今日（旧实现写 60 靠 NaN 兜住，已修正） |
-| `RpsBreakout` | 无 | 需要 121 根；由一条 SQL 聚合完成，见第 8 节 |
-| `PrivatePlacement` | 无 | 完全不用 K 线 |
+| MaVolume | ①只认"今天刚好金叉"，滞后且稀少<br>②放量基准**含当日**，巨量自己抬高门槛<br>③无趋势/不追高约束 | 多头排列（ma5>ma20>ma60）+ **近 5 日内**出现过金叉 + 前 20 日均量为基准 + 收盘不高于 ma20 的 15% |
+| TurtleTrade | ①20 日新高噪声大<br>②"成交额过亿"绝对阈值一刀切<br>③**按流通市值排序**与突破无关，还每天多打 50~200 次网络请求<br>④无突破幅度/量能确认 | **55 日**新高 + 收盘不超前高 5%（刚突破）+ ma20>ma60 + 量比≥1.3；按"相对强度 40% + 量比 30% + 突破幅度 30%"排序，**不再联网查市值** |
+| HighTightFlag | ①用 high/low 极值，插针即失真<br>②旗杆窗口包含当日（刚突破的票永远不满足"不破前高"）<br>③单日缩量当持续缩量<br>④**没有突破触发**，整理中就买 | 全部改用收盘价；旗杆 = 旗面之前的 50 日（t-60~t-11）；旗面 = 前 10 日振幅≤18% 且低点≥旗杆高点 80%；近 5 日均量≤前 20 日均量×0.85；**近 3 日内突破旗面上沿且今日仍站在其上 + 放量** |
+| LimitUpShakeout | ①要求"放量"，与"洗盘"语义相反（放量下跌更像出货）<br>②`low≥昨收` 不允许下探，与回踩常识相反<br>③无跌幅上限、无封板判断 | 昨日涨停（非一字板）→ 今日**缩量**（< 昨日 80%）+ 盘中可下探昨收 + 收盘不破 -3% + 站上 ma10 |
+| UptrendLimitDown | ①**跌停当天买入 = 接飞刀**<br>②不看是否封死（封死买不到）<br>③只看跌幅与放量，不看承接 | 改名"错杀承接"：趋势未破 + 今日跌≥6% 但**未封死跌停** + 长下影（收盘高于最低 3%）+ 收盘在振幅上半区 + 量比≥1.5 |
+| RpsBreakout | ①"突破"实为"距 120 日高点 10% 内"，会选下跌中继<br>②单一周期<br>③Top10% 有 200+ 只，不可执行 | **多周期 RPS（3 个月 60% + 12 个月 40%）** + 距 **250 日**新高 5% 内 + 一年正收益 + 阈值 80 + Top N |
+| PrivatePlacement | ①**"有定增公告"当买入信号是反的**（折价摊薄）<br>②没看发行价与现价关系<br>③7 天窗口无意义 | 改为**定增破发监控**：只留定向增发、剔除 ST、30 天窗口、按 `最新价/发行价` 升序（越破发越靠前）、溢价超 10% 不关注 |
 
-> `snap.enough_bars()` 统计的是**快照窗口内**的 K 线数；窗口下限由 `Settings.snapshot_days`
-> 控制（默认 130，最小 62）。
+同时**新增两个风格互补的策略**（原组合全是"追突破"，风格单一）：
 
----
-
-## 3. MaVolumeStrategy — 均线金叉 + 放量
-
-> 文件：`ma_volume.py`（40 行）· 路由键：`ma_volume` · `_MIN_BARS = 21`
-
-**想捕捉的形态**：短均线上穿长均线，同时成交量放大 —— 经典的"突破启动"信号。
-
-### 条件
-
-| # | 条件 | 公式 |
+| 新增 | 逻辑 | 为什么补 |
 |---|---|---|
-| 1 | 5 日均线上穿 20 日均线（金叉） | `ma5[t-1] < ma20[t-1]` 且 `ma5[t] > ma20[t]` |
-| 2 | 今日放量 | `volume[t] > 1.5 × mean(volume[t-20 .. t-1])` |
+| **TrendPullback** | 强势股（60 日涨幅≥15%）缩量回踩 ma20（触及 2% 内且收盘守住 97%） | "突破买入"对时点极敏感，**回调买入**胜率/盈亏比通常更稳；与追新高互补 |
+| **ReversalBounce** | 5 日跌≥15% + 收盘低于 ma20 的 85% + 下影线（≥40%）且收盘高出最低价 2% + 非封死跌停 | A 股短期存在反转效应；原组合在下跌市会全员空仓 |
 
-其中 `ma5[t] = mean(close[t-4..t])`，`ma20[t] = mean(close[t-19..t])`。
-
-注意条件 2 的"20 日均量"**包含今天**（`rolling(20).mean()` 的最后一个值），这会让今天的巨量把自己所在的均值抬高，稍微减弱了"放量"的敏感度——与 `HighTightFlag` 里用 `iloc[-21:-1]`（不含今天）的做法不一致，属于风格不统一。
-
-### 核心代码
-
-```python
-snap = self.engine.get_snapshot()                    # ma_volume.py
-
-ma5  = snap.rolling("close", 5)                      # 含当日
-ma20 = snap.rolling("close", 20)
-ma5_prev  = snap.rolling_shifted("close", 1, 5)      # 昨日 ma5
-ma20_prev = snap.rolling_shifted("close", 1, 20)     # 昨日 ma20
-vol_ma20  = snap.rolling("volume", 20)               # 含当日
-
-golden_cross = (ma5_prev < ma20_prev) & (ma5 > ma20)
-volume_surge = snap.col("volume") > vol_ma20 * self._VOL_SURGE_RATIO
-selected = snap.latest(golden_cross & volume_surge & snap.enough_bars(self._MIN_BARS))
-```
-
-### 图形直觉
-
-```
-     收盘价
-       │        ╱╲            ← 今天：短均线上穿 + 放量
-       │      ╱   ╲
-       │    ╱  ──── ╲  ma5（快）
-       │  ╱ ────────  ╲ ma20（慢）
-       │╱______________╲____
-              ↑
-           金叉点（必须正好是"昨天在下、今天在上"）
-```
-
-### 注意
-
-- 金叉判定要求**恰好发生在今天**。如果金叉是三天前，即使今天均线仍多头排列也不会选。这是"事件型"而非"状态型"策略。
-- 20 日均量含今天 → 见上。
-- 排序：无（按股票代码升序输出）。
+> 没有删除任何策略：`UptrendLimitDown` 与 `PrivatePlacement` 的**类名与 webhook_key 保持不变**（飞书群配置不用改），但语义已按上表修正。
 
 ---
 
-## 4. TurtleTradeStrategy — 海龟突破（本项目最复杂的策略）
+## 3. 通用过滤层：可交易性 & 质量
 
-> 文件：`turtle_trade.py`（84 行）· 路由键：`turtle` · `_MIN_BARS = 21`
+旧策略最致命的不是形态算错，而是把**根本买不到/不该买**的票选了出来。这些判断统一放在
+[filters.py](../sequoia_x/strategy/filters.py)，所有 K 线策略在判定形态前先过一遍：
 
-**想捕捉的形态**：创 20 日新高 + 有真实资金参与 + 不是高开低走的假阳线。
+| 过滤 | 判据 | 为什么 |
+|---|---|---|
+| 涨停/一字板 | 收盘 ≥ 昨收 × 板块涨停乘数，或 `high==low` | 收盘封板买不进；一字板无论涨跌都难成交 |
+| ST / *ST / 退市 | 名称含 `ST` / `退`（来自本地 `stock_info`） | 5% 涨跌幅下均线/突破形态全部失真，且有退市风险 |
+| 停牌 / 退市 | 该股最后一根 K 线 < 全市场最新交易日 | 否则策略在分析"几周前的形态" |
+| 次新 | 窗口内 K 线 < `min_history_bars`（默认 120） | 上市不足半年，60 日均线没有统计意义 |
+| 流动性 | 当日成交额 ≥ `min_turnover`（默认 5000 万），且不低于自身 20 日均额的一半 | 滑点会吃掉策略收益 |
+| 仙股 | 收盘价 ≥ `min_price`（默认 2 元） | 低价股噪声大、易被操纵 |
 
-### 条件
+涨跌停乘数来自 [limits.py](../sequoia_x/strategy/limits.py)（**主板 1.095/0.905 与旧实现完全一致**）：
 
-| # | 条件 | 公式 | 实现 |
+| 板块 | 前缀 | 涨停乘数 | 跌停乘数 |
 |---|---|---|---|
-| 1 | 突破 20 日新高 | `close[t] > max(high[t-20 .. t-1])` | `snap.rolling_shifted("high", 1, 20, "max")` |
-| 2 | 流动性过亿 | `turnover[t] > 100_000_000` | `snap.col("turnover") > _MIN_TURNOVER` |
-| 3 | 实体阳线（防空头陷阱） | `close[t] > open[t]` | `close > snap.col("open")` |
-| 4 | 真涨（非假阳线） | `close[t] > close[t-1]` | `close > snap.shift("close", 1)` |
-| 5 | 结果按**流通市值降序**排列 | — | `_get_market_caps` + `sort` |
+| 主板 | 60 / 00 | 1.095 | 0.905 |
+| 创业板 / 科创板 | 30 / 68 | 1.195 | 0.805 |
+| 北交所 | 43/83/87/92 | 1.295 | 0.705 |
 
-条件 3 和 4 是这个策略的"本地化改良"，注释写得很生动：
-
-```python
-# 【新增防守条件】拒绝郑州煤电式的高开低走大阴线！
-is_yang = close > snap.col("open")          # 实体必须是阳线（红柱）
-is_up   = close > snap.shift("close", 1)    # 必须是真涨，不能是假阳线
-```
-
-为什么要两条：`close > open` 只能保证"当天是阳线"，但可能是**低开后的假阳线**（比如昨天 10 元，今天开 8.5 收 8.8，仍是阳线但实际跌了 12%）。加上 `close > prev_close` 才排除了这种。
-
-### 市值排序（唯一会二次访问 baostock 的策略）
-
-```python
-def _get_market_caps(self, symbols) -> dict[str, float]:      # turtle_trade.py
-    # 流通股本 = 成交量 / (换手率% / 100)
-    circulating_shares = volume / (turn / 100)
-    # 流通市值 = 流通股本 × 不复权收盘价
-    market_caps[symbol] = circulating_shares * close
-```
-
-- 用 `adjustflag="3"`（**不复权**）查当天数据 —— 因为市值必须用真实股价，不能用复权价。
-- 换手率 `turn` 为 0 或空时跳过（`if turn > 0`），这类股票拿不到市值。
-- 排序：`candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)` —— 拿不到市值的按 0 处理，排在最后。
-
-**为什么按市值排？** 大市值股票流动性更好，突破后更容易延续；小市值容易一日游。这是经验法则，不是硬性风控。
-
-### 注意
-
-- 这一步是 `O(候选数)` 次**同步 HTTP 查询**，在 `bs.login()` 之后串行执行。候选 30 只就要 30 次往返。如果候选有几百只，这里会很慢。
-- 如果当天非交易日 / 盘中运行，`query_history_k_data_plus(start=today, end=today)` 返回空 → 所有市值缺失 → 排序等于没排（全部 0，`sort` 稳定，保持原顺序）。
-- 市值计算依赖"成交量单位是股、换手率是百分数"这个 baostock 约定。如果换数据源，这里是**最容易静默算错**的地方。
+> `is_st` / `is_stale` 两列由 `DataEngine._load_snapshot()` 一次性算好放进快照，策略层直接取用，
+> 不需要每个策略各查一次数据库。
 
 ---
 
-## 5. HighTightFlagStrategy — 高而窄的旗形
+## 4. 打分与 Top-N
 
-> 文件：`high_tight_flag.py`（52 行）· 路由键：`flag` · `_MIN_BARS = 40`
-
-**想捕捉的形态**：欧奈尔 CANSLIM 里的 "High Tight Flag" —— 先暴涨（旗杆），然后极窄幅横盘（旗面），缩量整理后等待二次突破。
-
-### 条件（代码里其实是 4 条，docstring 只写了 3 条）
-
-| # | 条件 | 公式 | 阈值含义 |
-|---|---|---|---|
-| 1 | 强动量（旗杆） | `max(high[40]) / min(low[40]) > 1.6` | 40 日内振幅超 60% |
-| 2 | 极度收敛（旗面） | `max(high[10]) / min(low[10]) < 1.15` | 最近 10 日振幅低于 15% |
-| 3 | 高位抗跌 | `min(low[10]) >= max(high[40]) × 0.8` | 回调不破前高 80% |
-| 4 | 缩量 | `volume[t] < 0.6 × mean(volume[t-20 .. t-1])` | 今天的量只有前 20 日均量的 6 成 |
-
-### 核心代码
+布尔筛选只能回答"符合/不符合"，无法排序。每个策略给出一个 `score`，再调用：
 
 ```python
-high40 = snap.rolling("high", 40, "max")                   # high_tight_flag.py
-low40  = snap.rolling("low", 40, "min")
-high10 = snap.rolling("high", 10, "max")
-low10  = snap.rolling("low", 10, "min")
-
-momentum      = high40 / low40 > self._MOMENTUM_RATIO      # 1.6
-consolidation = high10 / low10 < self._TIGHT_RATIO         # 1.15
-high_level    = low10 >= high40 * self._HIGH_LEVEL_RATIO   # 0.8（docstring 曾漏写）
-vol_ma20_prev = snap.rolling_shifted("volume", 1, 20)      # 不含今天的 20 日均量
-shrink        = snap.col("volume") < vol_ma20_prev * self._SHRINK_RATIO   # 0.6
-valid         = (low40 > 0) & (low10 > 0)                  # 除零保护
+snap.ranked(condition, score, limit=self.settings.max_picks or None)
 ```
 
-### 图形直觉
+`ranked()` 只取每只股票的**最后一行**、按 score 降序（同分按代码升序保证稳定）截断。
+默认 `max_picks = 30`：推送里 200 多只股票没有可执行性。
 
-```
-  价格
-   │  ╱╲                      ← 旗杆：40 天内从低点涨 60%+
-   │ ╱  ╲    ┌──┐┌─┐┌──┐      ← 旗面：最近 10 天振幅 < 15%
-   │╱    ╲───┘  └┘ └┘  └──    ← 且回调不低于旗杆顶的 80%
-   │                          ← 同时成交量萎缩到均量的 60% 以下
-   └──────────────────────────
-       40 日窗口 ┘  └ 10 日窗口
-```
-
-### 注意
-
-- 四个区间是**重叠**的：40 日窗口包含了 10 日窗口。所以条件 1 和 2 天然有张力——要"40 天振幅大"又"10 天振幅小"，本质就是在找"刚暴涨完正在横盘"的票。
-- 除零保护：`valid = (low40 > 0) & (low10 > 0)`，避免价格为 0 时除出 `inf`。
-- 这个策略选出的票通常很少（个位数），因为条件非常苛刻。
+> 打分权重是**经验设定**，不是拟合出来的 alpha（本项目还没有回测，见第 8 节）。
 
 ---
 
-## 6. LimitUpShakeoutStrategy — 涨停洗盘
+## 5. 九个策略
 
-> 文件：`limit_up_shakeout.py`（48 行）· 路由键：`shakeout` · `_MIN_BARS = 3`
+> 所有策略都要求"通过通用过滤"，下面只列各自特有的条件。
 
-**想捕捉的形态**：昨天涨停，今天放巨量收阴（洗掉浮筹），但**不跌破昨天的收盘价**（支撑有效）。次日往往继续涨。
+### 5.1 MaVolume — 多头排列 + 近 5 日金叉 + 放量
 
-### 条件
-
-| # | 条件 | 公式 |
-|---|---|---|
-| 1 | 昨日涨停 | `close[t-1] >= close[t-2] × 1.095` |
-| 2 | 今日收阴 | `close[t] < open[t]` |
-| 3 | 今日放巨量 | `volume[t] > volume[t-1] × 2.0` |
-| 4 | 支撑不破 | `low[t] >= close[t-1]` |
-
-```python
-prev1_close  = snap.shift("close", 1)                        # limit_up_shakeout.py
-prev2_close  = snap.shift("close", 2)
-prev1_volume = snap.shift("volume", 1)
-
-limit_up_yesterday = prev1_close >= prev2_close * self._LIMIT_UP_RATIO
-bearish_today      = snap.col("close") < snap.col("open")
-volume_surge       = snap.col("volume") > prev1_volume * self._VOL_SURGE_RATIO
-support_hold       = snap.col("low") >= prev1_close
-selected = snap.latest(... & snap.enough_bars(self._MIN_BARS))
-```
-
-### 图形直觉
-
-```
-   │              ┌──┐  ← 今天：放量收阴，但最低价不破昨收
-   │      ┌───────┘  │
-   │      │涨停       └──┐
-   │      │               ← 昨收 = 支撑线
-   └──────┴───────────────
-          t-2   t-1   t
-```
-
-### 涨跌停判定：按板块（v2 已修）
-
-旧实现把阈值写死成 `1.095`，只对主板成立；现在按代码前缀取乘数（`sequoia_x/strategy/limits.py`）：
-
-| 板块 | 代码前缀 | 涨跌幅限制 | 涨停乘数 | 跌停乘数 |
-|---|---|---|---|---|
-| 主板 | 60 / 00 | 10% | 1.095 | 0.905 |
-| 创业板 | 30 | **20%** | 1.195 | 0.805 |
-| 科创板 | 68 | **20%** | 1.195 | 0.805 |
-| 北交所 | 43/83/87/92 | **30%** | 1.295 | 0.705 |
-
-**主板乘数与旧实现完全一致**（1.095 / 0.905），所以这是"补上其它板块"，不是改变主板行为。
-0.5% 的容差用于吸收"涨跌停价四舍五入到分"带来的误差。
-
-修正掉的问题：创业板/科创板"涨 10% 的普通阳线"以前会被误判成"昨日涨停"，
-"跌 10%"会被误判成"跌停"——这两类**假信号**现在不会了。单元测试
-`tests/test_limits.py::test_gem_10pct_day_is_not_limit_up` 把这条钉死了。
-
-ST 股不需要特殊处理：主板 ST 的 5% 涨跌幅达不到 9.5% 门槛，这两个策略本来就不会在 ST 上触发。
-如需退回旧口径，命令行加 `--no-board-limits`（或设 `BOARD_AWARE_LIMITS=false`）。
-
----
-
-## 7. UptrendLimitDownStrategy — 上升趋势中的放量跌停
-
-> 文件：`uptrend_limit_down.py`（42 行）· 路由键：`limit_down` · `_MIN_BARS = 61`
-
-**想捕捉的形态**：趋势本来是好的，突然放巨量跌停 —— 往往是恐慌错杀或利空一次性释放，博反弹。
-
-### 条件
-
-| # | 条件 | 公式 |
-|---|---|---|
-| 1 | 昨日处于上升趋势（均线多头） | `ma20[t-1] > ma60[t-1]` |
-| 2 | 今日放量跌停 | `close[t] <= close[t-1] × 0.905` |
-| 3 | 巨量确认 | `volume[t] > 2.0 × ma20(volume)[t]` |
-
-```python
-ma20_prev = snap.rolling_shifted("close", 1, 20)                 # 昨日 ma20
-ma60_prev = snap.rolling_shifted("close", 1, 60)                 # 昨日 ma60
-vol_ma20  = snap.rolling("volume", 20)
-prev_close = snap.shift("close", 1)
-
-uptrend      = ma20_prev > ma60_prev
-limit_down   = snap.col("close") <= prev_close * self._LIMIT_DOWN_RATIO   # 0.905
-volume_surge = snap.col("volume") > vol_ma20 * self._VOL_SURGE_RATIO      # 2.0
-```
-
-趋势判定用**昨日**均线（`prev`）而不是今日，是为了避免今天的跌停把均线拉下来导致自我否定。
-
-### 注意
-
-- 涨跌停同样按板块判定（见第 6 节表格），创业板跌 10% 不再被当成跌停。
-- 三个指标都可能是 `NaN`（窗口不足），`NaN` 参与比较恒为 `False`，所以边界情况会自动跳过；`_MIN_BARS = 61` 已显式保证 60 日均线有昨日值。
-- 这个策略**本质上是在接下跌的刀**，任何风控（比如"跌停封单量""是否一字板"）都没有，实盘需谨慎。
-
----
-
-## 8. RpsBreakoutStrategy — RPS 相对强度突破
-
-> 文件：`rps_breakout.py`（62 行）· 路由键：`rps` · 无 `_MIN_BARS`
-
-**这是唯一一个不使用 `MarketSnapshot` 的策略**：它需要每只股票 120 个交易日以上的完整历史
-（`shift(120)` + 120 日滚动最高价），而快照窗口默认只有 130 个交易日，对长期停牌股会少算，
-导致横截面排名偏差。因此保持"整表读入 + groupby 计算"，确保选股结果不受窗口影响。
-它本身已经是一次批量读 + 全市场向量化，只是读取范围是全表（4 列，6.3 s / 440 MB）。
-
-### 两个概念
-
-1. **RPS（Relative Price Strength）**：把全市场按 N 日涨幅排名，取百分位（0~100）。`RPS=90` 表示"涨幅跑赢 90% 的股票"。
-2. **突破判定**：现价接近 120 日最高价（在 90% 以内）。
-
-### 条件
-
-| # | 条件 | 公式 |
-|---|---|---|
-| 1 | 120 日涨幅排名前 10% | `rank(pct=True) × 100 >= 90` |
-| 2 | 现价不低于 120 日高点的 90% | `close[t] >= max(high[t-119 .. t]) × 0.90` |
-
-可调参数（类属性，**硬编码不可配**）：
-
-```python
-rps_period: int = 120       # 回看窗口
-rps_threshold: int = 90     # RPS 阈值
-```
-
-### 实现拆解（v2：SQL 聚合，1.5 s / 0.4 MB）
-
-旧实现把整表 355 万行读进 pandas（440 MB）再分组计算。现在改成**一条 SQL 只返回
-每只股票的 4 个聚合值**（5,224 行），横截面排名仍在 pandas 里做（保证与旧实现逐位一致）：
-
-```python
-# sequoia_x/strategy/rps_breakout.py
-_RPS_AGGREGATE_SQL = """
-SELECT q.* FROM (
-    SELECT s.symbol,
-           (SELECT t.close FROM stock_daily t
-             WHERE t.symbol = s.symbol ORDER BY t.date DESC LIMIT 1)                AS close_now,
-           (SELECT t.close FROM stock_daily t
-             WHERE t.symbol = s.symbol ORDER BY t.date DESC LIMIT 1 OFFSET :period) AS close_period,
-           (SELECT MAX(t.high) FROM (
-                SELECT high FROM stock_daily u
-                 WHERE u.symbol = s.symbol ORDER BY u.date DESC LIMIT :period) t)   AS roll_high,
-           (SELECT COUNT(*) FROM (
-                SELECT 1 FROM stock_daily v
-                 WHERE v.symbol = s.symbol LIMIT :period))                          AS bars_in_window
-    FROM (SELECT DISTINCT symbol FROM stock_daily) s
-) q
-WHERE q.close_period IS NOT NULL
-  AND q.bars_in_window >= :min_bars
-  AND (SELECT MAX(date) FROM stock_daily)
-      = (SELECT MAX(z.date) FROM stock_daily z WHERE z.symbol = q.symbol)
-"""
-```
-
-每一列都是一个**走索引 `idx_symbol_date` 的小范围扫描**（最多 121 行），5,224 只股票
-合计只读约 63 万行，而不是 355 万行。
-
-后面两段仍在 pandas 里，语义与旧实现逐位相同：
-
-```python
-valid = agg[agg["close_period"].notna()].copy()          # 等价 dropna(pct_change)
-valid["pct_change"] = (valid["close_now"] - valid["close_period"]) / valid["close_period"]
-valid["rps"] = valid["pct_change"].rank(pct=True) * 100  # 横截面百分位
-strong = valid[valid["rps"] >= self.rps_threshold]
-selected = strong[strong["close_now"] >= strong["roll_high"] * self._BREAKOUT_RATIO]
-```
-
-> ⚠️ **踩坑记录**：最初写成 `WHERE EXISTS (SELECT 1 FROM stock_daily z, latest WHERE ...)`
-> 让 SQLite 对外层 5,224 只股票各做一次全表扫描，**卡死数分钟**。改成"两个标量
-> `MAX(date)` 子查询相等"后 1.5 s。另外试过 `ROW_NUMBER()` / `LAG()` + 窗口帧的写法，
-> 结果正确但要 12.6 s / 20 s（3.55M 行过临时 B 树），反而更慢。
-
-### 注意（这个策略的坑最多）
-
-| 问题 | 说明 |
+| # | 条件 |
 |---|---|
-| **内存** | 旧实现整表 355 万行 × 4 列 一次性载入（440 MB），小内存 VPS 上会 OOM。**已修复**：SQL 聚合后只有 0.4 MB |
-| **`latest_date` 不一定是全市场都有数据的日期** | 取的是表里最大的日期。如果只有少数股票更新到那天，RPS 排名就失真（SQL 里用 `MAX(z.date)` 过滤，缺数据的自然不参与） |
-| **突破 ≠ 新高** | 条件 `close >= roll_high × 0.90` 只要求"距 120 日高点不超过 10%"，策略名里的 "Breakout" 名不副实 |
-| **`min_periods=60`** | 上市不足 120 天但有 60 天数据的票也会算出 `roll_high`，但 `shift(120)` 为空 → 被剔除。所以实际门槛仍是 121 根 K 线；`bars_in_window >= 60` 只是保留旧语义 |
-| **除零产生 `inf`** | 若 120 日前收盘为 0（实测库中不存在），`pct_change` 为 `inf`，`rank` 会把 `inf` 排第一 |
-| **绕过 `DataEngine` 抽象** | 直接 `sqlite3.connect(self.engine.db_path)` 读库，不走 `get_ohlcv()`。因为需要"每股取最后 121 行"的 SQL 聚合，用 `get_ohlcv` 逐只查反而更慢（5,224 次）。换数据源时这里要单独改 |
-| **SQL 方言** | 用到 `LIMIT :param OFFSET :param` 与标量子查询，SQLite 3.25+ 均支持（实测 3.49.1） |
+| 1 | `ma5 > ma20 > ma60`（多头排列） |
+| 2 | 近 5 日内出现过 `ma5` 上穿 `ma20` |
+| 3 | 量比（今日量 / **前 20 日**均量）≥ 1.5 |
+| 4 | `close ≤ ma20 × 1.15`（不追高） |
 
----
+打分：量比 ×（1 + 20 日涨幅）。预期 5~20 只/天。
 
-## 9. PrivatePlacementStrategy — 定增公告监控
+### 5.2 TurtleTrade — 55 日新高突破
 
-> 文件：`private_placement.py`（73 行）· 路由键：`private_placement` · 无 `_MIN_BARS`
-
-**这个策略和其他 6 个完全不同**：它不碰 K 线、不碰 SQLite，而是**实时爬 akshare** 拉定增公告。本质上是个"公告监控"，只是借用了策略框架。
-
-### 数据源与流程
-
-```python
-df = ak.stock_qbzf_em()                       # 东方财富-全部增发
-df = df[df["发行方式"] == "定向增发"]           # 排除公开增发
-df["发行日期"] = pd.to_datetime(df["发行日期"], errors="coerce")
-df = df.dropna(subset=["发行日期"])
-df = df[df["发行日期"].dt.date >= today - 7天]  # 最近 7 天
-df = df.sort_values("发行日期", ascending=False)
-symbols = df["股票代码"].astype(str).str.extract(r"(\d{6})")[0].dropna().tolist()
-# 去重（同一只票可能多次定增）
-```
-
-| 项 | 值 |
+| # | 条件 |
 |---|---|
-| 回看天数 | `_LOOKBACK_DAYS = 7` |
-| 依赖 | `akshare.stock_qbzf_em()`（第三方，**接口可能随时变**） |
-| 失败行为 | `except Exception` → 记 error → 返回 `[]`（不影响其他策略） |
-| 输出 | 去重后的 6 位代码 |
-| 排序 | 按发行日期降序（最新在前） |
+| 1 | `close > max(high[t-55 .. t-1])` |
+| 2 | `close ≤ 前高 × 1.05`（刚突破，不追已远离的） |
+| 3 | `ma20 > ma60` 且 `close > ma60` |
+| 4 | 量比 ≥ 1.3 |
 
-### 注意
+打分：相对强度（120 日涨幅的市场分位）40% + 量比 30% + 突破幅度 30%。
+**不再按流通市值排序** —— 那与突破逻辑无关，且每天要为此多发 50~200 次 baostock 请求（≈9 秒）。
 
-- 列名 `"发行方式"`、`"发行日期"`、`"股票代码"` 是**中文硬编码**，akshare 一改接口就 `KeyError`。虽然被 try 包住不会崩，但会静默变成"每天都没结果"。
-- 正则 `r"(\d{6})"` 只取第一个 6 位数字，对 `"SH600000"` 这类也能正确提取。
-- 这是唯一一个**结果不依赖于本地数据库**的策略，所以即使 `--backfill` 没跑，它也能出结果。
+### 5.3 HighTightFlag — 旗形整理后的突破
+
+| # | 条件 |
+|---|---|
+| 1 | 旗杆：旗面之前 50 个交易日（t-60~t-11）`max(close)/min(close) ≥ 1.4` |
+| 2 | 旗面：前 10 日（t-10~t-1）收盘振幅 ≤ 18% |
+| 3 | 抗跌：旗面最低收盘 ≥ 旗杆最高收盘 × 80% |
+| 4 | 持续缩量：近 5 日均量 ≤ 前 20 日均量 × 0.85 |
+| 5 | 突破：近 3 日内突破旗面上沿（×1.002），今日仍站在其上（≥99.5%） |
+| 6 | 突破日量 > 前 5 日均量 × 1.2 |
+
+**预期频率很低**（真正的 HTF 一年只出现几次），多数交易日出 0 只是**正常现象**，不是 bug。
+
+### 5.4 LimitUpShakeout — 涨停后缩量回踩
+
+| # | 条件 |
+|---|---|
+| 1 | 昨日收盘涨停（按板块）且**不是一字板** |
+| 2 | 今日成交量 < 昨日 × 0.8（**缩量**） |
+| 3 | 今日最低价 ≤ 昨日收盘（允许下探） |
+| 4 | 今日收盘 ≥ 昨日收盘 × 0.97（不破 -3%） |
+| 5 | 收盘仍 > ma10（趋势未坏） |
+
+> 旧实现要求"今日放量 2 倍"，方向是反的：洗盘是浮筹被清洗、量能衰减；放量下跌更像出货。
+
+### 5.5 UptrendLimitDown — 趋势中的错杀承接
+
+| # | 条件 |
+|---|---|
+| 1 | `ma20 > ma60` 且 `close > ma60`（趋势未破） |
+| 2 | 今日 `close ≤ 昨收 × 0.94`（急跌 ≥6%） |
+| 3 | `close > 昨收 × 跌停乘数`（**没有封死跌停**，可以买入） |
+| 4 | `close > low × 1.03`（有下影线，盘中有承接） |
+| 5 | `close ≥ (high + low) / 2`（收在振幅上半区） |
+| 6 | 量比 ≥ 1.5（恐慌盘出清） |
+
+> 旧实现是"跌停买入"，属于接飞刀：跌停当天常封死买不到，次日惯性下跌概率高。
+> 现在只在"跌得急但收得回来"时入选，**预期频率低**。
+
+### 5.6 RpsBreakout — 多周期 RPS + 逼近一年新高
+
+| # | 条件 |
+|---|---|
+| 1 | 综合 RPS ≥ 80：`0.6 × rank(3 个月涨幅) + 0.4 × rank(12 个月涨幅)`，取全市场百分位 |
+| 2 | `close ≥ max(high[t-250 .. t]) × 0.95`（距一年新高 5% 以内） |
+| 3 | `close > 250 日前收盘`（一年正收益） |
+
+打分：RPS 70% + 距新高的接近程度 30%，取 Top N。
+唯一**不用** `MarketSnapshot` 的策略：需要完整 250 日历史，窗口版会少算长期停牌股。
+它用一条 SQL 只取回 5,224 行聚合值（实测 2.3 s / 0.4 MB，旧实现是 10.5 s / 440 MB）。
+
+### 5.7 TrendPullback — 强势股缩量回踩 20 日线（新增）
+
+| # | 条件 |
+|---|---|
+| 1 | `ma20 > ma60` 且 `close > ma60` |
+| 2 | 60 日涨幅 ≥ 15% |
+| 3 | `low ≤ ma20 × 1.02`（回踩到均线附近）且 `close ≥ ma20 × 0.97`（收盘守住） |
+| 4 | 量比 ≤ 0.9（回调没有明显放量） |
+
+打分：60 日涨幅 60% + 缩量程度 40%。止损参考：跌破 ma20 -3% 或 ma60。
+
+### 5.8 ReversalBounce — 超跌反弹（新增）
+
+| # | 条件 |
+|---|---|
+| 1 | 5 日跌幅 ≤ -15% |
+| 2 | `close ≤ ma20 × 0.85`（远离均线） |
+| 3 | 下影线占振幅 ≥ 40%，且收盘高于最低价 2%（当日止跌） |
+| 4 | 量比 ≥ 0.8（有承接，不是无量阴跌） |
+| 5 | 非封死跌停 |
+
+打分：超跌幅度 60% + 下影线 40%。
+> 在下跌市里候选会很多（实测可到 90 只），Top-N 截断后是"最超跌且最有承接的一批"。
+
+### 5.9 PrivatePlacement — 定增破发监控
+
+| # | 条件 |
+|---|---|
+| 1 | `发行方式 == 定向增发`（排除公开增发） |
+| 2 | 发行日期在最近 30 天内 |
+| 3 | 剔除名称含 ST / 退 的股票 |
+| 4 | `最新价 / 发行价 ≤ 1.10`（接近或跌破发行价） |
+
+排序：按 `最新价/发行价` 升序（越破发越靠前）。
+数据来自 `akshare.stock_qbzf_em()`，同时给出 `发行价格` 与 `最新价`（都是不复权价，可直接比较）。
+**它是事件提醒，不是形态选股**，也是唯一不依赖本地行情库的策略。
 
 ---
 
-## 10. 七个策略横向对比
+## 6. 横向对比
 
-| 策略 | 路由键 | 盯的形态 | 市场状态假设 | 最少 K 线 | 典型命中数 | 额外数据源 |
-|---|---|---|---|---|---|---|
-| MaVolume | `ma_volume` | 金叉 + 放量 | 趋势启动 | 21 | 几只~几十 | — |
-| TurtleTrade | `turtle` | 20 日新高 + 阳线 | 强势突破 | 21 | 几只~几十 | baostock（市值） |
-| HighTightFlag | `flag` | 暴涨后窄幅缩量 | 强势整理 | 40 | 0~5 | — |
-| LimitUpShakeout | `shakeout` | 涨停后放量洗盘 | 短线接力 | 3 | 几只 | — |
-| UptrendLimitDown | `limit_down` | 趋势中放量跌停 | 错杀反弹 | 61 | 0~几只 | — |
-| RpsBreakout | `rps` | RPS>90 且近 120 日高点 | 强者恒强 | 121 | 几十~上百 | — |
-| PrivatePlacement | `private_placement` | 有定增公告 | 事件驱动 | 0 | 几只~几十 | akshare |
+| 策略 | 标识 | 风格 | 关键窗口 | 预期命中 | 额外数据源 |
+|---|---|---|---|---|---|
+| MaVolume | `ma_volume` | 趋势启动 | 5/20/60 日 | 5~20 | — |
+| TurtleTrade | `turtle` | 突破 | 55 日 | 5~20 | — |
+| HighTightFlag | `flag` | 整理突破 | 50/10 日 | 0~3（罕见） | — |
+| LimitUpShakeout | `shakeout` | 短线接力 | 3 日 | 0~5 | — |
+| UptrendLimitDown | `limit_down` | 错杀承接 | 60 日 | 0~3（罕见） | — |
+| RpsBreakout | `rps` | 强者恒强 | 63/250 日 | 30（Top-N 截断） | — |
+| TrendPullback | `trend_pullback` | 回调低吸 | 20/60 日 | 10~20 | — |
+| ReversalBounce | `reversal_bounce` | 超跌反转 | 5/20 日 | 30（Top-N 截断） | — |
+| PrivatePlacement | `private_placement` | 事件 | 30 天 | 0~10 | akshare |
 
-### 三个"事件型" vs 四个"状态型"
-
-- **事件型**（要求形态发生在**今天**）：MaVolume 金叉、LimitUpShakeout 昨涨停、UptrendLimitDown 今跌停。错过一天就永远不选。
-- **状态型**（满足条件即可，可能连续多天入选）：HighTightFlag、RpsBreakout、PrivatePlacement、TurtleTrade（新高当天算事件，但可能连涨多天连续入选）。
-
----
-
-## 11. 共同的设计缺陷（改代码前必读）
-
-| # | 缺陷 | 影响 | 详见 |
-|---|---|---|---|
-| 1 | ~~涨跌停阈值 1.095 / 0.905 硬编码，未按板块区分~~ | **已修复**（`limits.py`，可用 `--no-board-limits` 回退） | [09](09-code-review-findings.md#p1-2) |
-| 2 | 所有阈值（5/20/40/60/120 日、1.5/1.6/1.15/0.6/2.0/0.9/100000000）全是魔法数字 | 调参要改代码，无法回测不同参数 | [09](09-code-review-findings.md) |
-| 3 | ~~每个策略独立扫全市场，重复计算 MA20 等指标 7 次~~ | **已修复**（v2 批量快照，见第 2 节） | [09](09-code-review-findings.md#p2-5) |
-| 4 | ~~`except Exception` 吞掉单只股票异常~~ | **已消除**（向量化后不再有单只循环） | [09](09-code-review-findings.md#p3-5) |
-| 5 | 没有回测 / 没有历史信号记录 | 无法评估策略有效性 | [09](09-code-review-findings.md) |
-| 6 | 没有排除 ST / 停牌 / 次新 | 选到 ST 或刚上市 7 天的票 | [09](09-code-review-findings.md) |
+风格分布：**趋势 3（MaVolume / TrendPullback / RPS）+ 突破 2（Turtle / Flag）+ 短线 1（Shakeout）+ 反转 1（ReversalBounce）+ 错杀 1（LimitDown）+ 事件 1（PrivatePlacement）**。
+这样在单边上涨、震荡、下跌三种市场状态下都能有输出。
 
 ---
 
-## 12. 想自己加一个策略？
+## 7. 一轮运行的实测（2026-11-23 收盘数据，9 个策略）
 
-三步，参见 [10 HOWTO](10-how-to-recipes.md)：
+| 策略 | 命中 | 耗时 |
+|---|---:|---:|
+| MaVolume | 5 | 6.1 s（含快照 4.5 s） |
+| TurtleTrade | 10 | 0.5 s |
+| HighTightFlag | 0 | 0.9 s |
+| LimitUpShakeout | 1 | 0.9 s |
+| UptrendLimitDown | 0 | 0.9 s |
+| RpsBreakout | 30 | 2.3 s |
+| TrendPullback | 16 | 0.5 s |
+| ReversalBounce | 30 | 0.8 s |
+| PrivatePlacement | 4 | 17.7 s（akshare 抓取） |
+| **合计** | **96** | **30.5 s** |
+
+> 快照加载 4.5 s 由第一个策略承担，之后共享。`PrivatePlacement` 的 17.7 s 是 akshare
+> 网络抓取，不想要就用 `--strategy` 排除它。
+
+---
+
+## 8. 已知局限（别把它当"已验证有效"）
+
+1. **没有回测**：所有阈值和打分权重都是经验设定，没有验证过胜率/盈亏比。
+   要判断有效性，得先把每天的选股结果落库（[09 · P3-6](09-code-review-findings.md)），
+   再算后续 1/3/5 日收益。**在拿到回测结果之前，这些策略只应视为"候选筛选器"。**
+2. **阈值不是最优**：本轮的取值是在单日数据上做的"合理区间"标定（保证每天有 5~30 只候选），
+   不是参数寻优。
+3. **ST 依赖名称**：`stock_info` 目录为空时 ST 过滤会失效（会打 WARNING）。
+4. **北交所无数据**：baostock 不提供北交所行情，4/8 开头的票永远不会入选。
+5. **不含基本面**：没有估值、业绩、行业、板块效应等因子，纯价格行为。
+
+---
+
+## 9. 想自己加一个策略？
 
 ```python
-# 1. 新建 sequoia_x/strategy/my_strategy.py
+# 1) 新建 sequoia_x/strategy/my_strategy.py
 class MyStrategy(BaseStrategy):
     webhook_key = "my_strategy"
-    _MIN_BARS = 30
+    _MIN_BARS = 61
 
     def run(self) -> list[str]:
         snap = self.engine.get_snapshot()
 
-        ma30 = snap.rolling("close", 30)
-        condition = snap.col("close") > ma30
+        ma20 = snap.rolling("close", 20)
+        condition = snap.col("close") > ma20
+        score = volume_ratio(snap)
 
-        selected = snap.latest(condition & snap.enough_bars(self._MIN_BARS))
+        selected = snap.ranked(
+            tradable_mask(snap, self.settings) & condition & snap.enough_bars(self._MIN_BARS),
+            score,
+            self.settings.max_picks or None,
+        )
         logger.info(f"MyStrategy 选出 {len(selected)} 只股票")
         return selected
 ```
 
 ```python
-# 2. 在 sequoia_x/strategy/registry.py 里登记一行
+# 2) 在 sequoia_x/strategy/registry.py 登记一行
 STRATEGIES[MyStrategy.webhook_key] = MyStrategy
-
-# 3. 可选：.env 里配专属机器人
-#    STRATEGY_WEBHOOK_MY_STRATEGY=https://open.feishu.cn/...
 ```
 
-注册表让 `main.py` 不需要改动，并且立刻支持
-`--list-strategies` 与 `--strategy my_strategy`。        logger.info(f"MyStrategy 选出 {len(selected)} 只股票")
-        return selected
-
-# 2. main.py 的 strategies 列表加一行
-MyStrategy(engine=engine, settings=settings),
-
-# 3. .env 加一行（可选，不加就推到默认机器人）
-STRATEGY_WEBHOOK_MY_STRATEGY=https://open.feishu.cn/...
+```bash
+# 3) 立刻可用
+python main.py --list-strategies
+python main.py --push-now --strategy my_strategy --dry-run
 ```
 
-下一步：配置与推送机制 → [06 配置与通知](06-config-and-notify.md)
+**检查清单**：继承 `BaseStrategy`、覆盖 `webhook_key`、用 `get_snapshot()` 而非逐只查库、
+条件全部向量化、先过 `tradable_mask`、用 `ranked()` 排序截断、结尾打一条 `logger.info`。

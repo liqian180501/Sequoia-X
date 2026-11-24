@@ -63,7 +63,7 @@ settings = get_settings()                       # 1. 读 .env / 环境变量 →
 logger   = get_logger(__name__)                 # 2. rich 日志
 engine   = DataEngine(settings)                 # 3. 建库建表（幂等）
 count    = engine.sync_today_bulk()             # 4. 8 进程并行补数据 → 3.5M 行的表
-strategies = [ MaVolumeStrategy(...), ... ]     # 5. 实例化 7 个策略
+strategies = [ MaVolumeStrategy(...), ... ]     # 5. 实例化 9 个策略
 notifier = FeishuNotifier(settings)             # 6. 推送器
 for s in strategies:                            # 7. 逐个跑，有结果就推送
     selected = s.run()
@@ -157,7 +157,7 @@ Sequoia-X/
 
 所有策略内部都用 pandas 的整列运算（`rolling` / `shift` / 布尔索引），而不是逐行 `for` 循环。等价于 Java 里"用 Stream + parallel 代替手写 for 循环"。
 
-对 5000 只股票 × 700 根 K 线来说，`iterrows()` 会慢 100 倍以上（每个元素都要构造一个 Python 对象）。所以 7 个策略文件里都能看到同一句注释：「向量化，严禁 iterrows」。
+对 5000 只股票 × 700 根 K 线来说，`iterrows()` 会慢 100 倍以上（每个元素都要构造一个 Python 对象）。所以策略文件里统一遵循「向量化，禁止 Python 循环」。
 
 ### 6.3 增量更新
 

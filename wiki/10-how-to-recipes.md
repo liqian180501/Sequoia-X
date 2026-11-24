@@ -88,7 +88,7 @@ STRATEGY_WEBHOOK_PULLBACK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx
 
 ### 步骤 4：加一个确定性测试
 
-`tests/test_pullback_ma20.py`——见 [08 第 7 节](08-testing-and-quality.md#7-怎么补第一个像样的测试示范)的模板，把 `_get_market_caps` 换成你的策略不需要的外部调用（如果没有，就不用 patch）。
+`tests/test_pullback_ma20.py`——见 [08 第 7 节](08-testing-and-quality.md#7-怎么补第一个像样的测试示范)的模板：用 mock 引擎 + 合成快照，完全离线。
 
 ### 步骤 5：验证
 

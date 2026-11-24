@@ -10,7 +10,7 @@
 每天收盘后跑一次 `python main.py`：
 
 ```
-从 baostock 补当天行情 → 存入本地 SQLite → 7 个选股策略各扫一遍全市场 5224 只股票
+从 baostock 补当天行情 → 存入本地 SQLite → 9 个选股策略各扫一遍全市场 5224 只股票
 → 命中结果的策略各自推一条飞书卡片到对应的机器人
 ```
 
@@ -51,7 +51,7 @@ python main.py --dry-run --push-now  # 只看结果不推送
 | [02 Python 速成（Java 视角）](02-python-for-java-devs.md) | 语法/对象模型/模块/异常/打包，全部对照 Java 概念 |
 | [03 pandas 实战手册](03-pandas-field-guide.md) | DataFrame 心智模型 + 本项目用到的每一个 pandas API |
 | [04 数据层 DataEngine](04-data-layer.md) | 表结构、baostock 对接、三种同步路径、多进程模型、容错 |
-| [05 策略系统](05-strategy-system.md) | BaseStrategy 契约 + 7 个策略逐条公式化拆解 |
+| [05 策略系统](05-strategy-system.md) | BaseStrategy 契约 + 通用过滤层 + 9 个策略的设计与阈值 |
 | [06 配置与通知](06-config-and-notify.md) | pydantic-settings、环境变量优先级、Webhook 路由、飞书卡片 |
 | [07 运行与运维](07-run-and-ops.md) | 安装、回填、日常运行、cron、故障排查表 |
 | [08 测试与质量](08-testing-and-quality.md) | pytest + hypothesis 属性测试、ruff、如何跑 |
@@ -90,7 +90,7 @@ python main.py --dry-run --push-now  # 只看结果不推送
 |---|---:|---:|
 | RPS 策略 | 10.5 s / **440 MB** | **1.5 s / 0.4 MB**（SQL 聚合，7.3×） |
 | 查股票名（208 只） | **37.7 s**（每只 180 ms） | **3 ms**（一次 30 s 建目录，之后长期命中） |
-| 查流通市值（同日重跑） | ~9 s（54 只 × 170 ms） | **5 ms**（按 `(symbol, date)` 缓存） |
+| 查流通市值（海龟排序用） | ~9 s（每天 50~200 次请求） | **已移除**（改为相对强度排序） |
 | `main()` 策略+推送阶段（不含同步） | **~187 s** | **6.9 s**（热跑） |
 
 选股结果在每一轮都做了**逐只比对：6/6 策略完全一致**。
@@ -98,7 +98,7 @@ python main.py --dry-run --push-now  # 只看结果不推送
 详见 [05 §2](05-strategy-system.md)（策略侧）、[04 §4.4](04-data-layer.md)（数据侧）、
 [03 §17](03-pandas-field-guide.md)（`全局 rolling + cumcount 掩码` 手法，比 `groupby.transform` 快 43 倍）。
 
-> ⚠️ 两个新增的本地表：`stock_info`（代码→名称）、`market_cap`（代码+日期→流通市值）。
+> ⚠️ 新增的本地表 `stock_info`（代码→名称，同时用于 ST 过滤）。
 > 用 `CREATE TABLE IF NOT EXISTS` 自动建，老库无需迁移。
 
 ### 本次写文档时实测验证过的事实| 结论 | 验证方式 |
