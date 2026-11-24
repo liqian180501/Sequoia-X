@@ -132,7 +132,14 @@ def rps_signals(
 def strategy_signals(key: str, snap: MarketSnapshot, settings: Settings):
     """取某个策略的 (condition, score)。"""
     if key == "rps":
-        return rps_signals(snap)
+        # 参数必须从策略类读取，否则镜像会悄悄用旧参数（曾因此导致回测与线上选出不同股票）
+        cls = STRATEGIES["rps"]
+        return rps_signals(
+            snap,
+            threshold=cls.rps_threshold,
+            short_weight=cls._SHORT_WEIGHT,  # noqa: SLF001
+            near_high=cls._NEAR_HIGH,  # noqa: SLF001
+        )
     strategy = STRATEGIES[key](engine=None, settings=settings)  # type: ignore[arg-type]
     return strategy._signals(snap)
 
