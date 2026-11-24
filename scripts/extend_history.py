@@ -62,9 +62,7 @@ def main(argv: list[str] | None = None) -> int:
 
     while time.monotonic() < deadline:
         rounds += 1
-        written = engine.extend_history(
-            args.target, max_seconds=args.timeout, workers=args.workers
-        )
+        written = engine.extend_history(args.target, max_seconds=args.timeout, workers=args.workers)
         if written < 0:
             logger.info(f"补齐完成：没有待补任务（共 {rounds} 轮）")
             return 0

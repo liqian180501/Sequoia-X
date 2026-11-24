@@ -323,7 +323,6 @@ class DataEngine:
         """从 SQLite 载入最近 ``days`` 个交易日的全市场行情。"""
         import time
 
-
         t0 = time.perf_counter()
 
         with sqlite3.connect(self.db_path) as conn:
@@ -497,9 +496,7 @@ class DataEngine:
 
         deadline = time.monotonic() + budget
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
-        payload = [
-            (chunk, deadline, _StopFlag(), label == "向前补齐") for chunk in chunks
-        ]
+        payload = [(chunk, deadline, _StopFlag(), label == "向前补齐") for chunk in chunks]
 
         started = time.monotonic()
         results: list = []
@@ -554,17 +551,16 @@ class DataEngine:
             return 0
 
         records = list(
-            df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
-            .itertuples(index=False, name=None)
+            df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]].itertuples(
+                index=False, name=None
+            )
         )
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany(_UPSERT_SQL, records)
             conn.commit()
 
         count = len(records)
-        logger.info(
-            f"{label}：写入 {count} 行（{df['date'].nunique()} 个交易日，幂等 upsert）"
-        )
+        logger.info(f"{label}：写入 {count} 行（{df['date'].nunique()} 个交易日，幂等 upsert）")
         return count
 
     def _record_floors(self, empty_ranges: list[tuple[str, str]]) -> None:
@@ -626,9 +622,7 @@ class DataEngine:
             end = (date.fromisoformat(first_date) - timedelta(days=1)).strftime("%Y-%m-%d")
             if end < start_date:
                 continue
-            tasks.append(
-                (symbol, DataEngine._to_baostock_code(symbol), start_date, end)
-            )
+            tasks.append((symbol, DataEngine._to_baostock_code(symbol), start_date, end))
         return tasks
 
     def extend_history(

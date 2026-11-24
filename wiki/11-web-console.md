@@ -73,7 +73,30 @@ python web/server.py --port 8123 --host 127.0.0.1
 - 成交量按当日最大量归一化，画在价格下方；
 - MA20 是前端现算的（20 根收盘价均值），不占后端。
 
-### 3.4 回测
+### 3.4 跟踪（纸面账本）
+
+把"每天推了哪些票、后来涨没涨"变成可复盘的事实，数据来自 `pick_history` 表：
+
+| 列 | 含义 |
+|---|---|
+| 笔数 / 天数 | 回看窗口内的选股笔数与覆盖的交易日 |
+| 待结算 | 信号日在窗口末尾、还没有 T+1 行情（显示"待结算"） |
+| h1 / h5 均值 | **T+1 开盘买、T+h 收盘卖**，已扣往返成本 0.2% |
+| 胜率 | 净收益 > 0 的比例 |
+| 超额 | 减去同日全市场等权收益中位数（判断选股能力，而不是看大盘） |
+
+下方是最近 80 条留痕明细，点代码可跳到 K 线。
+
+留痕是**幂等**的（`(run_date, strategy, symbol)` 主键）：同一天重复跑选股不会产生重复行。
+`source` 列区分 `live`（当天真实跑出来的）与 `replay`（历史回放），避免把回放数据当成当时的信号。
+
+想立刻有历史样本：
+
+```bash
+python scripts/replay_picks.py --days 120            # 用同一份 _signals 回放 120 个交易日
+```
+
+### 3.5 回测
 
 读 `data/backtest_summary.json`（由 `scripts/backtest.py --out` 生成），
 按"策略 × 样本内/样本外"展示 h1/h5 超额、年化、回撤、夏普。
@@ -99,6 +122,7 @@ python scripts/backtest.py --horizons 1,5 --top 30 \
 | POST | `/api/select` | 跑选股：`{"strategies":["ma_volume"],"limit":30}` |
 | POST | `/api/push` | 推送上次结果，必须 `{"confirm": true}` |
 | GET | `/api/kline?symbol=600000&limit=120` | K 线（升序返回） |
+| GET | `/api/ledger?days=60` | 纸面账本：各策略业绩 + 最近留痕 |
 | GET | `/api/backtest` | 回测结果 JSON |
 
 后端把"算"和"发"分开了：`select` 只算不写，`push` 只发不重算。这样点错按钮最多是白等几秒，

@@ -77,6 +77,7 @@
     <button data-tab="overview" class="active">总览</button>
     <button data-tab="select">选股</button>
     <button data-tab="kline">行情</button>
+    <button data-tab="ledger">跟踪</button>
     <button data-tab="backtest">回测</button>
   </nav>
 </header>
@@ -121,6 +122,22 @@
     <div class="chart-wrap" style="margin-top:12px"><svg id="chart" width="100%" height="440"></svg></div>
   </section>
 
+  <!-- 跟踪 -->
+  <section id="tab-ledger" class="hidden">
+    <div class="row">
+      <span class="muted">回看</span>
+      <select id="ledger-days" style="background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 10px">
+        <option value="30">30 天</option>
+        <option value="60" selected>60 天</option>
+        <option value="120">120 天</option>
+        <option value="365">1 年</option>
+      </select>
+      <button class="btn" id="btn-ledger">刷新</button>
+      <span class="muted" id="ledger-note"></span>
+    </div>
+    <div id="ledger-body" style="margin-top:14px"></div>
+  </section>
+
   <!-- 回测 -->
   <section id="tab-backtest" class="hidden">
     <div class="row">
@@ -148,7 +165,7 @@ function showTab(name) {
   const btn = document.querySelector(`nav button[data-tab="${name}"]`);
   if (!btn) return;
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
-  ["overview", "select", "kline", "backtest"].forEach((t) =>
+  ["overview", "select", "kline", "ledger", "backtest"].forEach((t) =>
     $("#tab-" + t).classList.toggle("hidden", t !== name));
   history.replaceState(null, "", "#" + name);
 }
@@ -341,6 +358,61 @@ function drawChart(bars) {
   t2.textContent = `最新 ${last.d}  收 ${last.c.toFixed(2)}  MA20 ${ma[n - 1] ? ma[n - 1].toFixed(2) : "—"}`;
 }
 
+/* ── 跟踪（纸面账本） ── */
+async function loadLedger() {
+  const days = $("#ledger-days").value;
+  $("#ledger-note").textContent = "加载中…";
+  try {
+    const d = await api(`/api/ledger?days=${days}`);
+    renderLedger(d);
+    $("#ledger-note").textContent = `自 ${d.since} 起 · 已扣往返成本 ${(d.cost * 100).toFixed(2)}%`;
+  } catch (e) {
+    $("#ledger-note").textContent = "失败：" + e.message;
+  }
+}
+
+function renderLedger(d) {
+  if (!d.rows.length) {
+    $("#ledger-body").innerHTML = `<div class="muted">还没有留痕。
+      运行一次 <code>python main.py --dry-run</code> 或在「选股」页跑一次，之后每天的结果都会自动记录。</div>`;
+    return;
+  }
+  let html = `<table><thead><tr><th>策略</th><th class="num">笔数</th><th class="num">天数</th>
+    <th class="num">待结算</th><th class="num">h1 均值</th><th class="num">h1 胜率</th>
+    <th class="num">h1 超额</th><th class="num">h5 均值</th><th class="num">h5 胜率</th>
+    <th class="num">h5 超额</th></tr></thead><tbody>`;
+  for (const r of d.rows) {
+    html += `<tr><td><b>${r.strategy}</b></td><td class="num">${r.trades}</td>
+      <td class="num">${r.days}</td><td class="num muted">${r.pending}</td>
+      <td class="num ${pctCls(r.h1_mean)}">${fmt(r.h1_mean)}</td>
+      <td class="num">${r.h1_win === null ? "—" : fmt(r.h1_win, 1) + "%"}</td>
+      <td class="num ${pctCls(r.h1_exc)}">${fmt(r.h1_exc)}</td>
+      <td class="num ${pctCls(r.h5_mean)}">${fmt(r.h5_mean)}</td>
+      <td class="num">${r.h5_win === null ? "—" : fmt(r.h5_win, 1) + "%"}</td>
+      <td class="num ${pctCls(r.h5_exc)}">${fmt(r.h5_exc)}</td></tr>`;
+  }
+  html += `</tbody></table><h2>最近留痕（按信号日倒序，最多 80 条）</h2>`;
+  html += `<table><thead><tr><th>信号日</th><th>策略</th><th>排名</th><th>代码</th>
+    <th class="num">收盘</th><th class="num">T+1</th><th class="num">T+5</th></tr></thead><tbody>`;
+  for (const r of d.recent) {
+    html += `<tr><td>${r.run_date}</td><td class="muted">${r.strategy}</td>
+      <td class="num muted">${r.rank ?? "—"}</td>
+      <td><a href="#" data-symbol="${r.symbol}" class="sym" style="color:inherit">${r.symbol}</a></td>
+      <td class="num">${fmt(r.close)}</td>
+      <td class="num ${pctCls(r.fwd_1)}">${r.fwd_1 === null ? "待结算" : (r.fwd_1 > 0 ? "+" : "") + fmt(r.fwd_1) + "%"}</td>
+      <td class="num ${pctCls(r.fwd_5)}">${r.fwd_5 === null ? "待结算" : (r.fwd_5 > 0 ? "+" : "") + fmt(r.fwd_5) + "%"}</td></tr>`;
+  }
+  $("#ledger-body").innerHTML = html + "</tbody></table>";
+  document.querySelectorAll("#ledger-body a.sym").forEach((a) => {
+    a.onclick = (ev) => {
+      ev.preventDefault();
+      $("#symbol").value = a.dataset.symbol;
+      showTab("kline");
+      loadKline();
+    };
+  });
+}
+
 /* ── 回测 ── */
 async function loadBacktest() {
   const data = await api("/api/backtest");
@@ -373,6 +445,8 @@ $("#btn-none").onclick = () => document.querySelectorAll("#strategy-checks input
 $("#btn-kline").onclick = loadKline;
 $("#symbol").addEventListener("keydown", (e) => { if (e.key === "Enter") loadKline(); });
 $("#btn-backtest").onclick = loadBacktest;
+$("#btn-ledger").onclick = loadLedger;
+$("#ledger-days").onchange = loadLedger;
 
 const initialTab = (location.hash || "#overview").slice(1);
 if (initialTab !== "overview") showTab(initialTab);
@@ -380,6 +454,7 @@ if (initialTab !== "overview") showTab(initialTab);
 loadStatus().then(() => {
   if (initialTab === "kline" && !$("#symbol").value) { $("#symbol").value = "600000"; loadKline(); }
   if (initialTab === "backtest") loadBacktest();
+  if (initialTab === "ledger") loadLedger();
 }).catch((e) => { document.body.insertAdjacentHTML("afterbegin",
   `<div style="padding:12px;color:#f05252">加载失败：${e.message}</div>`); });
 </script>

@@ -137,14 +137,15 @@ def strategy_signals(key: str, snap: MarketSnapshot, settings: Settings):
     return strategy._signals(snap)
 
 
-def picks_by_date(
-    df: pd.DataFrame, cond: pd.Series, score: pd.Series, top: int
-) -> pd.DataFrame:
+def picks_by_date(df: pd.DataFrame, cond: pd.Series, score: pd.Series, top: int) -> pd.DataFrame:
     """每个交易日按分数取前 top 只，返回 (date, symbol)。"""
     mask = np.asarray(pd.Series(cond).fillna(False), dtype=bool)
     frame = pd.DataFrame(
-        {"symbol": df["symbol"].to_numpy()[mask], "date": df["date"].to_numpy()[mask],
-         "score": pd.Series(score).to_numpy()[mask]}
+        {
+            "symbol": df["symbol"].to_numpy()[mask],
+            "date": df["date"].to_numpy()[mask],
+            "score": pd.Series(score).to_numpy()[mask],
+        }
     )
     frame = frame.sort_values(["date", "score", "symbol"], ascending=[True, False, True])
     if top:
@@ -197,15 +198,11 @@ def evaluate(
         equity = (1 + daily).cumprod()
         result["total"] = (equity.iloc[-1] - 1) * 100
         years = len(daily) / 244.0
-        result["annual"] = (
-            (equity.iloc[-1] ** (1 / years) - 1) * 100 if years > 0 else float("nan")
-        )
+        result["annual"] = (equity.iloc[-1] ** (1 / years) - 1) * 100 if years > 0 else float("nan")
         peak = equity.cummax()
         result["mdd"] = ((equity / peak) - 1).min() * 100
         std = daily.std()
-        result["sharpe"] = (
-            daily.mean() / std * np.sqrt(244) if std and std > 0 else float("nan")
-        )
+        result["sharpe"] = daily.mean() / std * np.sqrt(244) if std and std > 0 else float("nan")
     return result
 
 
@@ -268,8 +265,7 @@ def main(argv: list[str] | None = None) -> None:
     market = market_forward_returns(df, horizons)
     snap = build_snapshot(df)
     print(
-        f"{len(df):,} 行 / {df['symbol'].nunique():,} 只 / "
-        f"{df['date'].min()} ~ {df['date'].max()}"
+        f"{len(df):,} 行 / {df['symbol'].nunique():,} 只 / {df['date'].min()} ~ {df['date'].max()}"
     )
 
     keys = (

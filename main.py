@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
+from sequoia_x.data.ledger import SignalLedger
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.registry import STRATEGIES, all_strategy_ids, resolve_strategies
@@ -186,8 +187,12 @@ def _run_strategies(
     settings: Settings,
     notifier: FeishuNotifier | None,
     dry_run: bool,
+    ledger: SignalLedger | None = None,
 ) -> list[tuple[str, int, float]]:
-    """依次运行策略并推送，返回 (策略名, 命中数, 耗时) 列表。"""
+    """依次运行策略并推送，返回 (策略名, 命中数, 耗时) 列表。
+
+    每次选股都会写入 ``pick_history``（dry-run 也写——留痕的是信号，不是推送）。
+    """
     logger = get_logger(__name__)
     results: list[tuple[str, int, float]] = []
 
@@ -202,6 +207,13 @@ def _run_strategies(
             results.append((name, 0, time.perf_counter() - started))
             continue
         elapsed = time.perf_counter() - started
+
+        if picks and ledger is not None:
+            # 用行情最后一天而不是 today()：周末/节假日跑批时信号日仍是最后一个交易日
+            try:
+                ledger.record(engine.get_snapshot().market_last_date, cls.webhook_key, picks)
+            except Exception as exc:  # 留痕失败不能影响选股与推送
+                logger.warning(f"{name} 留痕失败（忽略）：{exc}")
 
         if not picks:
             logger.info(f"{name} 无选股结果，跳过推送")
@@ -346,7 +358,10 @@ def main(argv: list[str] | None = None) -> None:
 
         # ── 选股 + 推送 ──
         notifier = None if args.dry_run else FeishuNotifier(settings)
-        results = _run_strategies(strategy_classes, engine, settings, notifier, args.dry_run)
+        ledger = SignalLedger(settings.db_path)
+        results = _run_strategies(
+            strategy_classes, engine, settings, notifier, args.dry_run, ledger
+        )
         total = time.perf_counter() - started
         _print_summary(results, total, args.dry_run)
         logger.info(f"Sequoia-X V2 运行完成，总耗时 {total:.1f}s")

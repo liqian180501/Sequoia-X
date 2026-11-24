@@ -55,6 +55,7 @@ from sequoia_x.core.config import get_settings  # noqa: E402
 from sequoia_x.core.logger import get_logger  # noqa: E402
 from sequoia_x.data.cache import StockDirectory  # noqa: E402
 from sequoia_x.data.engine import DataEngine  # noqa: E402
+from sequoia_x.data.ledger import SignalLedger  # noqa: E402
 from sequoia_x.notify.feishu import FeishuNotifier  # noqa: E402
 from sequoia_x.strategy.base import BaseStrategy  # noqa: E402
 from sequoia_x.strategy.registry import STRATEGIES, resolve_strategies  # noqa: E402
@@ -101,9 +102,7 @@ def db_stats(db_path: str) -> dict:
         row = conn.execute(
             "SELECT COUNT(*), COUNT(DISTINCT symbol), MIN(date), MAX(date) FROM stock_daily"
         ).fetchone()
-        stats.update(
-            rows=row[0], symbols=row[1], first_date=row[2], last_date=row[3]
-        )
+        stats.update(rows=row[0], symbols=row[1], first_date=row[2], last_date=row[3])
         stats["trading_days"] = conn.execute(
             "SELECT COUNT(DISTINCT date) FROM stock_daily"
         ).fetchone()[0]
@@ -181,10 +180,7 @@ def candles(db_path: str, symbol: str, limit: int = 120) -> dict:
     rows.reverse()
     return {
         "symbol": symbol,
-        "bars": [
-            {"d": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]}
-            for r in rows
-        ],
+        "bars": [{"d": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in rows],
     }
 
 
@@ -200,6 +196,7 @@ class App:
         self.engine = DataEngine(self.settings)
         self.directory = StockDirectory(self.settings.db_path)
         self.notifier = FeishuNotifier(self.settings)
+        self.ledger = SignalLedger(self.settings.db_path)
 
     def status(self) -> dict:
         db = db_stats(self.settings.db_path)
@@ -257,6 +254,15 @@ class App:
             "results": results,
             "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 留痕（幂等）：同一天重复运行不会重复写入
+        run_date = snap.market_last_date
+        for item in results:
+            if item["symbols"]:
+                try:
+                    self.ledger.record(run_date, item["key"], item["symbols"])
+                except Exception as exc:
+                    logger.warning(f"留痕失败（忽略）：{exc}")
+
         _LAST_RUN.clear()
         _LAST_RUN.update(payload)
         return payload
@@ -346,6 +352,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 data["name"] = self.app.directory.get_names([symbol]).get(symbol, "")
                 self._json(data)
+                return
+            if parsed.path == "/api/ledger":
+                days = min(max(int((query.get("days") or ["60"])[0]), 5), 365)
+                strategy = (query.get("strategy") or [None])[0]
+                self._json(self.app.ledger.report(days=days, strategy=strategy))
                 return
             if parsed.path == "/api/backtest":
                 if not BACKTEST_JSON.exists():
