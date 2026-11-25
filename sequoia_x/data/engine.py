@@ -156,7 +156,24 @@ def _bs_fetch_batch(task: tuple) -> tuple[list, dict]:
 
                 got = 0
                 while rs.next():
-                    rows.append([symbol] + rs.get_row_data())
+                    data = rs.get_row_data()
+                    # baostock 对"上市前/无交易的区间"会返回 **全空字符串的行**，
+                    # 不是 0 行。旧实现把这些空行也计入 got>0，于是：
+                    # ① 父进程清洗后 0 行可写；② 因为 got>0 不算 empty，历史下界永远
+                    # 不会被记录 → 同一批股票每轮重试、永远补不完（实测卡在 249 只）。
+                    # 这里要求 date 与 close 都有值才算一条有效行情。
+                    if len(data) < 6 or not data[0].strip() or not data[4].strip():
+                        continue
+                    # 停牌日 baostock 会返回"有日期、收盘价有值、但 volume=0"的行。
+                    # 父进程本来就要按 volume>0 过滤，如果这里不先剔掉：
+                    # get>0 会让它不算 empty（历史下界不记录），而清洗后一行不剩（0 写入），
+                    # 结果就是这批股票每轮重试、永远补不完。
+                    try:
+                        if float(data[5]) <= 0:
+                            continue
+                    except ValueError:
+                        continue
+                    rows.append([symbol] + data)
                     got += 1
             except Exception:
                 stats["failed"] += 1
