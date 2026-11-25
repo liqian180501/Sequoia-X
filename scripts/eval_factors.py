@@ -41,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--factor", default="all", help="逗号分隔的因子名，all=全部")
     parser.add_argument("--horizon", type=int, default=5, help="持有交易日数")
     parser.add_argument("--start", default="2024-01-02", help="评估起始日")
+    parser.add_argument("--end", default=None, help="评估截止日（用于样本内/外切分）")
     parser.add_argument("--layers", action="store_true", help="额外打印分层收益")
     args = parser.parse_args(argv)
 
@@ -48,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     df = bt.load_history(settings.db_path)
     df = bt.attach_st_flag(df, settings.db_path)
     df = df[df["date"] >= args.start].reset_index(drop=True)
+    if args.end:
+        df = df[df["date"] < args.end].reset_index(drop=True)
     if df.empty:
         logger.error("指定区间没有数据")
         return 1
