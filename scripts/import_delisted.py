@@ -8,8 +8,11 @@
 数据来源
 --------
 * **退市清单**：akshare ``stock_info_sh_delist``（沪）+ ``stock_info_sz_delist``（深）；
-* **历史行情**：akshare ``stock_zh_a_hist(adjust="hfq")``，**后复权**，与库里 baostock 的
-  后复权口径语义一致（两者的基准价不同，但同一只股票内部的收益率/均线关系等价）。
+* **历史行情**：优先 baostock（``adjustflag=1`` 后复权，与库里口径**完全一致**）；
+  baostock 不可用时退回 akshare ``stock_zh_a_hist(adjust="hfq")``。
+
+两个源都要的原因是：它们各自会整段时间不可用（akshare 走东财、baostock 会封 IP），
+而退市清单只能从 akshare 的交易所接口拿、历史行情两家都能给——互补才跑得通。
 
 为什么不用同花顺 dump
 --------------------
@@ -95,6 +98,8 @@ def load_delisted(since: str) -> pd.DataFrame:
     merged["delist"] = pd.to_datetime(merged["delist"], errors="coerce")
     merged["code"] = merged["code"].astype(str).str.zfill(6)
     merged = merged.dropna(subset=["delist"])
+    # 剔除 B 股（200xxx 深 B、900xxx 沪 B）：本项目是 A 股策略，库里也没有 B 股行情
+    merged = merged[~merged["code"].str.startswith(("200", "900"))]
     merged = merged[merged["delist"] >= since]
     return merged.sort_values("delist").reset_index(drop=True)
 
@@ -116,10 +121,57 @@ def normalize(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     for col in ("open", "high", "low", "close", "volume", "turnover"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
     out = out[(out["close"] > 0) & (out["volume"] > 0)]
+    # 东财的成交量单位是"手"，baostock 是"股"——统一成股，避免混库
+    out["volume"] = out["volume"] * 100
     return out.dropna(subset=["open", "high", "low", "close"])
 
 
-def fetch_bars(code: str, start: str, end: str, attempts: int = 3) -> pd.DataFrame:
+def _bs_code(symbol: str) -> str:
+    """纯数字代码 → baostock 代码（6 开头沪市，0/3 开头深市，4/8 北交所不支持）。"""
+    return f"sh.{symbol}" if symbol.startswith("6") else f"sz.{symbol}"
+
+
+def fetch_bars_baostock(code: str, start: str, end: str) -> pd.DataFrame:
+    """用 baostock 取退市股后复权日线（需调用方已经 login）。"""
+    import baostock as bs
+
+    rs = bs.query_history_k_data_plus(
+        _bs_code(code),
+        "date,open,high,low,close,volume,amount",
+        start_date=start,
+        end_date=end,
+        frequency="d",
+        adjustflag="1",  # 1=后复权，与 stock_daily 现有数据一致
+    )
+    rows = []
+    while rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "turnover"])
+    df.insert(0, "symbol", code)
+    for col in ("open", "high", "low", "close", "volume", "turnover"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[(df["close"] > 0) & (df["volume"] > 0)]
+    return df.dropna(subset=["open", "high", "low", "close"])
+
+
+def fetch_bars(code: str, start: str, end: str, source: str = "auto") -> pd.DataFrame:
+    """按数据源抓一只退市股的历史，``auto`` 时 akshare 失败自动降级到 baostock。"""
+    if source == "baostock":
+        return fetch_bars_baostock(code, start, end)
+    if source == "akshare":
+        return fetch_bars_akshare(code, start, end)
+    try:
+        bars = fetch_bars_akshare(code, start, end)
+        if not bars.empty:
+            return bars
+    except Exception:  # noqa: BLE001 auto 模式下静默降级
+        pass
+    return fetch_bars_baostock(code, start, end)
+
+
+def fetch_bars_akshare(code: str, start: str, end: str, attempts: int = 3) -> pd.DataFrame:
     """抓一只退市股的后复权日线，带有限退避重试（东财接口偶发 ConnectionError）。"""
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -139,10 +191,43 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="补入退市股历史（修生存偏差）")
     parser.add_argument("--since", default="2016-01-01", help="只补该日期之后退市的股票")
     parser.add_argument("--limit", type=int, default=0, help="最多处理几只（0=全部，调试用）")
+    parser.add_argument(
+        "--source",
+        choices=("auto", "akshare", "baostock"),
+        default="auto",
+        help="历史行情来源（auto=akshare 失败自动降级到 baostock）",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只抓取不入库")
     args = parser.parse_args(argv)
 
     settings = get_settings()
+
+    # baostock 是"先登录再查询"的会话式接口，整个导入过程只登录一次
+    bs_session = False
+    if args.source in ("auto", "baostock"):
+        import baostock as bs
+
+        login = bs.login()
+        if login.error_code == "0":
+            bs_session = True
+            logger.info("baostock 登录成功")
+        elif args.source == "baostock":
+            logger.error(f"baostock 登录失败：{login.error_code} {login.error_msg}")
+            return 1
+        else:
+            logger.warning(f"baostock 不可用（{login.error_code}），只用 akshare")
+
+    try:
+        return _run_import(args, settings)
+    finally:
+        if bs_session:
+            import baostock as bs
+
+            bs.logout()
+
+
+def _run_import(args, settings) -> int:
+    """真正的导入流程（登录/登出由 main 负责）。"""
     targets = load_delisted(args.since)
     if args.limit:
         targets = targets.head(args.limit)
@@ -162,8 +247,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             bars = fetch_bars(
                 code,
-                args.since.replace("-", ""),
-                (delist + pd.Timedelta(days=30)).strftime("%Y%m%d"),
+                args.since,
+                (delist + pd.Timedelta(days=30)).strftime("%Y-%m-%d"),
+                args.source,
             )
         except Exception as exc:  # 单只失败不影响整体
             logger.warning(f"{code} {name} 抓取失败：{type(exc).__name__}: {str(exc)[:60]}")
